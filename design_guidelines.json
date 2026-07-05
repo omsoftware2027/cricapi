@@ -1,0 +1,74 @@
+{
+  "theme": "light",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "typography": {
+    "headings": "Cabinet Grotesk, sans-serif",
+    "body": "IBM Plex Sans, sans-serif",
+    "data_numbers": "IBM Plex Mono, monospace",
+    "hierarchy": {
+      "h1": "text-2xl sm:text-3xl font-bold tracking-tight text-neutral-900",
+      "h2": "text-lg sm:text-xl font-semibold tracking-tight text-neutral-900",
+      "h3": "text-base font-semibold text-neutral-800",
+      "body": "text-sm text-neutral-700",
+      "table_header": "text-xs font-semibold uppercase tracking-wider text-neutral-500 bg-neutral-50/80",
+      "table_data": "text-sm font-mono text-neutral-900",
+      "table_data_primary": "text-sm font-semibold text-neutral-900"
+    }
+  },
+  "colors": {
+    "background": "#FDFDFD",
+    "surface": "#FFFFFF",
+    "border": "#E5E5E5",
+    "border_subtle": "#F5F5F5",
+    "text_primary": "#0A0A0A",
+    "text_secondary": "#525252",
+    "primary_accent": "#BE123C",
+    "primary_accent_hover": "#9F1239",
+    "primary_accent_muted": "#FFF1F2",
+    "state_success": "#16A34A",
+    "state_error": "#DC2626"
+  },
+  "layout": {
+    "structure": "Fixed Sidebar + Scrollable Main Content Area",
+    "sidebar": "w-72 border-r border-neutral-200 bg-neutral-50/50 flex flex-col h-screen sticky top-0",
+    "main_content": "flex-1 flex flex-col min-h-screen bg-white",
+    "spacing": "p-8 for main sections, gap-6 between layout blocks, py-2 px-3 for dense table cells"
+  },
+  "components": {
+    "button_primary": "inline-flex items-center justify-center rounded-sm bg-[#BE123C] text-white font-medium px-5 py-2.5 text-sm transition-colors hover:bg-[#9F1239] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#BE123C]",
+    "button_secondary": "inline-flex items-center justify-center rounded-sm border border-neutral-200 bg-white text-neutral-900 font-medium px-5 py-2.5 text-sm transition-colors hover:bg-neutral-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-neutral-200",
+    "input": "flex h-11 w-full rounded-sm border border-neutral-300 bg-white px-4 py-2 text-sm text-neutral-900 placeholder:text-neutral-400 transition-all focus:border-[#BE123C] focus:outline-none focus:ring-1 focus:ring-[#BE123C]",
+    "table_container": "w-full overflow-x-auto border border-neutral-200 rounded-sm",
+    "table": "w-full text-left border-collapse",
+    "table_row": "border-b border-neutral-100 hover:bg-neutral-50/50 transition-colors",
+    "table_cell": "py-2.5 px-4 align-middle whitespace-nowrap",
+    "badge": "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold bg-neutral-100 text-neutral-800"
+  },
+  "features": {
+    "input_section": "Top of main area. Clean, wide input field with a prominent 'Scrape' button beside it.",
+    "loading_state": "Table row skeletons (h-10) with animate-pulse. Disable input and button while loading. Show 'Extracting scorecard...' text.",
+    "error_state": "Clear error message below the input field in red (#DC2626). Must gracefully handle generic extraction errors vs Cloudflare blocks.",
+    "history_sidebar": "Left sidebar displaying previously scraped scorecards. List items should show truncated match title, date/time, and a 'View' & 'Delete' action on hover.",
+    "preview_section": "Rendered below the input after successful scrape. Show Match Info (Title, Venue, Result) in a clean header. Use Tabs (Innings 1, Innings 2) or stacked dense tables for Batting and Bowling. Keep columns compact."
+  },
+  "motion": {
+    "hover": "transition-all duration-200 ease-in-out",
+    "loading": "animate-pulse for table skeletons"
+  },
+  "accessibility": {
+    "contrast": "Ensure all text meets WCAG AA 4.5:1 ratio. Text colors are deliberately high contrast (900 and 500).",
+    "testing_attributes": "All interactive elements MUST include data-testid. Examples: data-testid='url-input', data-testid='scrape-button', data-testid='download-csv-btn', data-testid='history-item', data-testid='history-delete-btn'."
+  },
+  "instructions_to_main_agent": [
+    "Use pure JavaScript (.js/.jsx) for all components. Do NOT use TypeScript (.tsx).",
+    "Adopt a 'Linear/Retool' aesthetic: Sharp corners (rounded-sm), stark white backgrounds, dense layouts, and highly visible data.",
+    "Do not wrap data tables in bloated Card components. Use the 'table_container' styles provided to keep tables looking like a native spreadsheet/data grid.",
+    "Use IBM Plex Mono for numerical data in tables (Runs, Balls, 4s, 6s, SR, Economy) to ensure perfect vertical alignment of digits.",
+    "In the preview, visually separate the Batting table and Bowling table within an innings using generous vertical spacing (e.g., mt-8) or distinct subheadings.",
+    "Format the CSV download so all data (Match Info, Innings 1 Batting/Bowling, Innings 2 Batting/Bowling) is logically sequenced into a single file.",
+    "Use the Crimson accent color (#BE123C) sparingly. It represents the cricket ball and should only be used for primary actions (Scrape button, active tab states, focus rings)."
+  ],
+  "media": {
+    "image_urls": []
+  }
+}
