@@ -1,52 +1,45 @@
 # Cricket Scorecard Scraper — PRD
 
-## Original Problem Statement
-> can you create a webscrapping project, if i paste a link , i need to download the data in csv a cricket Score card
-> Example link user provided: https://cricheroes.com/scorecard/25954216/individual/professional-cricket-academy-vs-st-martins-cricket-academy/live
+## Original Problem
+User: "can you create a webscrapping project, if i paste a link, i need to download the data in csv a cricket Score card"
 
-## User Choices (from ask_human)
-- Any pasted link (generic scraper)
-- CSV: full match summary + both batting + bowling (single file)
-- Both innings in one CSV
-- Preview scorecard in tables before downloading
-- Keep history of past scraped scorecards
-
-## Tech Stack
-- Backend: FastAPI + curl_cffi (Chrome TLS impersonation) + BeautifulSoup4/lxml + MongoDB
-- Frontend: React 19 + Tailwind + lucide-react + axios
-- Design: Swiss / high-contrast "Retool-Linear" (crimson #BE123C accent, IBM Plex + Cabinet Grotesk)
-
-## Supported sources
-- ✅ Cricbuzz (fully working)
-- ✅ ESPN Cricinfo (generic parser)
-- ❌ CricHeroes — blocked by Cloudflare from server IPs (surfaces a clear 422 error message)
+User's initial URL was a **CricHeroes** scorecard. CricHeroes is Cloudflare-protected at the IP layer — this app now bypasses it via a **Bright Data residential proxy** provided by the user.
 
 ## Architecture
-- `backend/scrapers.py` — `scrape(url)`, `scorecard_to_csv(sc)`, `detect_source()`, `ScrapeError`, `CloudflareBlocked`
-- `backend/server.py` — routes:
-  - `POST /api/scrape` → scrape URL and persist
-  - `GET  /api/scorecards` → list (newest first)
-  - `GET  /api/scorecards/{id}` → single scorecard
-  - `GET  /api/scorecards/{id}/csv` → download CSV
-  - `DELETE /api/scorecards/{id}` → remove
-- `frontend/src/App.js` — sidebar (history), URL input, preview with innings tabs, batting & bowling tables, Download CSV button
+- **Backend**: FastAPI (`server.py`) + scrapers module (`scrapers.py`) + config (`config.py`)
+- **Frontend**: React 19 + Tailwind (Retool/Linear aesthetic, Cabinet Grotesk + IBM Plex fonts)
+- **Storage**: MongoDB (`test_database.scorecards`) for history
+- **Scraping**:
+  - `cricbuzz.com` → `curl_cffi` (Chrome TLS fingerprint) + BeautifulSoup DOM parsing
+  - `espncricinfo.com` → `curl_cffi` + BeautifulSoup DOM parsing
+  - `cricheroes.com` → Bright Data residential proxy + private JSON API `api.cricheroes.in/api/v1/scorecard/get-scorecard/{match_id}` (`api-key: cr!CkH3r0s`, `udid` header)
 
-## Implemented (Jan 2026)
-- URL paste → server-side scrape (Cricbuzz DOM parser: batting rows w/ dismissal, bowling rows, extras, total, DNB, FOW; ESPN generic table parser)
-- Live preview with match meta (title, venue, toss, result), innings tabs, batting (7 cols) & bowling (8 cols) tables
-- Single-file CSV export via `/csv` endpoint
-- History sidebar (list + click-to-reload + delete-with-confirm)
-- Client-side URL validation with unified `data-testid="error-message"` banner
-- Clear error messaging for Cloudflare-blocked sites (cricheroes)
-- Full `data-testid` coverage on every interactive/data element
+## Endpoints
+- `POST /api/scrape` — takes `{url}`, returns scorecard, persists to Mongo
+- `GET /api/scorecards` — history list
+- `GET /api/scorecards/{id}` — one scorecard
+- `GET /api/scorecards/{id}/csv` — CSV download with `attachment` header
+- `DELETE /api/scorecards/{id}` — remove
 
-## Testing
-- Backend (iteration_1): 10/10 endpoint scenarios pass
-- Frontend E2E (iteration_2): 6/6 flows pass (validation, scrape, tab switch, CSV download 200, history click reload, delete confirm)
+## Features Implemented (Aug 07, 2026)
+- Paste-and-scrape UI with client-side URL validation and red error banner
+- Full batting (Batter, Dismissal, R, B, 4s, 6s, SR) and bowling (Bowler, O, M, R, W, NB, WD, ECON) tables
+- Innings tabs when multi-innings match
+- Single-file CSV export (MATCH INFO + per-innings BATTING/BOWLING/EXTRAS/FOW)
+- History sidebar with re-view + delete
+- Cricbuzz + ESPN Cricinfo scrapers (Jul 05, 2026)
+- CricHeroes scraper via Bright Data proxy (Aug 07, 2026)
 
-## Backlog / Next
-- P1: Bypass Cloudflare (FlareSolverr or paid scraping proxy) to enable CricHeroes
-- P1: Match-level XLSX export (multi-sheet: Info, Inn1-Batting, Inn1-Bowling, ...)
-- P2: Auto-refresh live scorecards on interval
-- P2: Search / filter / bulk-export history
-- P2: Share-view link (public read-only URL for a stored scorecard)
+## Env Vars (backend/.env)
+- `MONGO_URL`, `DB_NAME`, `CORS_ORIGINS`
+- `BRIGHTDATA_PROXY_HOST=brd.superproxy.io`
+- `BRIGHTDATA_PROXY_PORT=44445`
+- `BRIGHTDATA_PROXY_USER` (user-supplied)
+- `BRIGHTDATA_PROXY_PASS` (user-supplied)
+
+## Backlog / Not Implemented
+- P1: Bulk download (multiple scorecards → ZIP)
+- P1: Fall-of-wickets and partnerships as separate CSV sections/columns
+- P2: Cost meter for Bright Data usage
+- P2: Compare-two-matches view
+- P2: Public shareable link for a saved scorecard

@@ -20,7 +20,7 @@ const sourceBadge = (src) => {
   const map = {
     cricbuzz: { label: "Cricbuzz", cls: "bg-amber-50 text-amber-800 border-amber-200" },
     cricinfo: { label: "Cricinfo", cls: "bg-sky-50 text-sky-800 border-sky-200" },
-    cricheroes: { label: "CricHeroes", cls: "bg-neutral-100 text-neutral-700 border-neutral-200" },
+    cricheroes: { label: "CricHeroes", cls: "bg-emerald-50 text-emerald-800 border-emerald-200" },
   };
   const s = map[src] || { label: src || "?", cls: "bg-neutral-100 text-neutral-700 border-neutral-200" };
   return (
@@ -296,7 +296,7 @@ function App() {
       <main className="flex-1 flex flex-col min-h-screen">
         <header className="px-6 sm:px-10 pt-10 pb-6 border-b border-neutral-100">
           <h1 className="font-heading text-2xl sm:text-3xl font-bold tracking-tight">Cricket Scorecard Scraper</h1>
-          <p className="mt-2 text-sm text-neutral-500 max-w-2xl">Paste a public Cricbuzz or ESPN Cricinfo scorecard URL. Preview the batting &amp; bowling for every innings, then download the full match as a single CSV.</p>
+          <p className="mt-2 text-sm text-neutral-500 max-w-2xl">Paste a public Cricbuzz, ESPN Cricinfo or CricHeroes scorecard URL. Preview the batting &amp; bowling for every innings, then download the full match as a single CSV.</p>
         </header>
 
         <div className="px-6 sm:px-10 py-8">
@@ -331,8 +331,7 @@ function App() {
           )}
 
           <div className="mt-3 text-[11px] text-neutral-400 flex flex-wrap gap-x-3 gap-y-1">
-            <span>Supported: <span className="text-neutral-600 font-medium">cricbuzz.com</span>, <span className="text-neutral-600 font-medium">espncricinfo.com</span>.</span>
-            <span>Cricheroes is blocked by Cloudflare on server IPs.</span>
+            <span>Supported: <span className="text-neutral-600 font-medium">cricbuzz.com</span>, <span className="text-neutral-600 font-medium">espncricinfo.com</span>, <span className="text-neutral-600 font-medium">cricheroes.com</span>.</span>
           </div>
 
           {loading && (

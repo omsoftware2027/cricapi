@@ -1,14 +1,23 @@
 """
 Cricket scorecard scrapers for multiple sites.
-Supports: Cricbuzz, ESPN Cricinfo, Cricheroes (blocked by Cloudflare - best-effort)
+Supports: Cricbuzz, ESPN Cricinfo, Cricheroes (via Bright Data residential proxy)
 """
 from __future__ import annotations
 import re
 from typing import Optional
 from urllib.parse import urlparse
 
+import requests as _requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cc_requests
+
+from config import (
+    brightdata_proxy_url,
+    CRICHEROES_API_BASE,
+    CRICHEROES_API_KEY,
+    CRICHEROES_UDID,
+    CRICHEROES_UA,
+)
 
 
 class ScrapeError(Exception):
@@ -50,19 +59,194 @@ def detect_source(url: str) -> str:
 
 def scrape(url: str) -> dict:
     src = detect_source(url)
+    if src == "cricheroes":
+        # CricHeroes has its own API path; no HTML fetch needed
+        return _scrape_cricheroes(url)
     html = _fetch_html(url)
     if src == "cricbuzz":
         return _scrape_cricbuzz(html, url)
     if src == "cricinfo":
         return _scrape_cricinfo(html, url)
-    if src == "cricheroes":
-        # If we reach here, Cloudflare didn't block, try a generic approach
-        raise ScrapeError(
-            "Cricheroes scraping is not supported (site blocks server requests via Cloudflare)."
-        )
     raise ScrapeError(
-        "Unsupported site. Please paste a Cricbuzz or ESPN Cricinfo scorecard URL."
+        "Unsupported site. Please paste a Cricbuzz, ESPN Cricinfo or CricHeroes scorecard URL."
     )
+
+
+# --------------------------- CRICHEROES ---------------------------
+
+_CRICHEROES_MATCH_RE = re.compile(r"/scorecard/(\d+)")
+
+
+def _cricheroes_match_id(url: str) -> Optional[str]:
+    m = _CRICHEROES_MATCH_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _scrape_cricheroes(url: str) -> dict:
+    match_id = _cricheroes_match_id(url)
+    if not match_id:
+        raise ScrapeError(
+            "Could not extract the match ID from that CricHeroes URL. "
+            "It should look like https://cricheroes.com/scorecard/<match_id>/..."
+        )
+
+    proxy = brightdata_proxy_url()
+    if not proxy:
+        raise ScrapeError(
+            "CricHeroes is Cloudflare-protected. A Bright Data residential proxy is required. "
+            "Please configure BRIGHTDATA_PROXY_USER and BRIGHTDATA_PROXY_PASS on the server."
+        )
+
+    api_url = f"{CRICHEROES_API_BASE}/scorecard/get-scorecard/{match_id}"
+    headers = {
+        "User-Agent": CRICHEROES_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://cricheroes.com",
+        "Referer": "https://cricheroes.com/",
+        "api-key": CRICHEROES_API_KEY,
+        "udid": CRICHEROES_UDID,
+        "device-type": "Chrome: 128.0.0.0",
+    }
+    try:
+        r = _requests.get(
+            api_url,
+            headers=headers,
+            proxies={"http": proxy, "https": proxy},
+            verify=False,
+            timeout=90,
+        )
+    except Exception as e:
+        raise ScrapeError(f"Failed to reach CricHeroes via proxy: {e}")
+
+    if r.status_code != 200:
+        raise ScrapeError(f"CricHeroes API returned HTTP {r.status_code}.")
+    try:
+        payload = r.json()
+    except ValueError:
+        raise ScrapeError("CricHeroes API returned invalid JSON.")
+    if not payload.get("status"):
+        err = (payload.get("error") or {}).get("message") or "Unknown error"
+        raise ScrapeError(f"CricHeroes API error: {err}")
+
+    d = payload["data"]
+
+    # Match meta
+    team_a = d.get("team_a") or {}
+    team_b = d.get("team_b") or {}
+    match_title = f"{team_a.get('name','')} vs {team_b.get('name','')}"
+    tour = d.get("tournament_name") or ""
+    if tour:
+        match_title = f"{match_title}, {tour}"
+    venue_parts = [d.get("ground_name") or "", d.get("city_name") or ""]
+    venue = ", ".join([p for p in venue_parts if p])
+    toss = d.get("toss_details") or ""
+    result = (d.get("match_summary") or {}).get("summary") or d.get("match_result") or ""
+
+    # Innings — merge each team's scorecard entries and sort by inning number
+    innings_list = []
+    for team in (team_a, team_b):
+        team_name = team.get("name") or ""
+        for sc in team.get("scorecard") or []:
+            inn_num = sc.get("inning") or 0
+            # Match up header info from team.innings by inning number
+            inn_meta = {}
+            for inn in team.get("innings") or []:
+                if inn.get("inning") == inn_num:
+                    inn_meta = inn
+                    break
+
+            total_run = inn_meta.get("total_run", "")
+            total_wicket = inn_meta.get("total_wicket", "")
+            overs_played = inn_meta.get("overs_played", "")
+            total = f"{total_run}/{total_wicket}" if total_run != "" else ""
+
+            # Batting
+            batting_rows = []
+            for b in sc.get("batting") or []:
+                batting_rows.append({
+                    "batter": (b.get("name") or "").strip(),
+                    "dismissal": (b.get("how_to_out") or "").strip(),
+                    "runs": str(b.get("runs", "")),
+                    "balls": str(b.get("balls", "")),
+                    "fours": str(b.get("4s", "")),
+                    "sixes": str(b.get("6s", "")),
+                    "sr": str(b.get("SR", "")),
+                })
+
+            # Bowling
+            bowling_rows = []
+            for bw in sc.get("bowling") or []:
+                overs = bw.get("overs", "")
+                balls = bw.get("balls", "")
+                # cricheroes stores overs and balls separately; overs like 3, balls like 2 => "3.2"
+                if balls:
+                    overs_str = f"{overs}.{balls}"
+                else:
+                    overs_str = str(overs)
+                bowling_rows.append({
+                    "bowler": (bw.get("name") or "").strip(),
+                    "overs": overs_str,
+                    "maidens": str(bw.get("maidens", "")),
+                    "runs": str(bw.get("runs", "")),
+                    "wickets": str(bw.get("wickets", "")),
+                    "no_balls": str(bw.get("noball", "")),
+                    "wides": str(bw.get("wide", "")),
+                    "econ": str(bw.get("economy_rate", "")),
+                })
+
+            # Extras summary text
+            extras_obj = sc.get("extras") or {}
+            extras_str = ""
+            if extras_obj:
+                extras_str = f"Extras {extras_obj.get('total','')} {extras_obj.get('summary','')}".strip()
+
+            total_line = ""
+            if total_run != "":
+                total_line = f"Total {total_run}/{total_wicket} ({overs_played} Overs)"
+
+            # Yet to bat
+            dnb = sc.get("to_be_bat") or []
+            dnb_str = ""
+            if isinstance(dnb, list) and dnb:
+                names = [x.get("name","") if isinstance(x, dict) else str(x) for x in dnb]
+                dnb_str = "Yet to bat: " + ", ".join([n for n in names if n])
+
+            # Fall of wickets - cricheroes has a summary string ready to use
+            fow_obj = sc.get("fall_of_wicket") or {}
+            fow_str = ""
+            if isinstance(fow_obj, dict):
+                summary = fow_obj.get("summary")
+                if summary:
+                    fow_str = f"Fall of Wickets: {summary}"
+
+            innings_list.append({
+                "innings_number": int(inn_num) if inn_num else len(innings_list) + 1,
+                "team": team_name,
+                "total": total,
+                "overs": str(overs_played),
+                "score_header": f"{team_name} {total} ({overs_played} Ov)".strip(),
+                "batting": batting_rows,
+                "bowling": bowling_rows,
+                "extras": extras_str,
+                "total_line": total_line,
+                "did_not_bat": dnb_str,
+                "fall_of_wickets": fow_str,
+            })
+
+    innings_list.sort(key=lambda x: x["innings_number"])
+
+    if not innings_list:
+        raise ScrapeError("CricHeroes returned no innings data for this match.")
+
+    return {
+        "source": "cricheroes",
+        "url": url,
+        "match_title": match_title.strip(", "),
+        "result": result,
+        "venue": venue,
+        "toss": toss,
+        "innings": innings_list,
+    }
 
 
 # --------------------------- CRICBUZZ ---------------------------
