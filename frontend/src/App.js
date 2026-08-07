@@ -31,11 +31,14 @@ const sourceBadge = (src) => {
 };
 
 // ------------ Tables ------------
-const BattingTable = ({ rows }) => (
+const BattingTable = ({ rows }) => {
+  const hasPid = rows.some((r) => r.player_id);
+  return (
   <div data-testid={SCRAPER.battingTable} className="w-full overflow-x-auto border border-neutral-200 rounded-sm">
     <table className="w-full text-left border-collapse">
       <thead>
         <tr className="bg-neutral-50/80 text-xs font-semibold uppercase tracking-wider text-neutral-500">
+          {hasPid && <th className="py-2.5 px-4">Player ID</th>}
           <th className="py-2.5 px-4">Batter</th>
           <th className="py-2.5 px-4">Dismissal</th>
           <th className="py-2.5 px-4 text-right">R</th>
@@ -47,10 +50,11 @@ const BattingTable = ({ rows }) => (
       </thead>
       <tbody>
         {rows.length === 0 && (
-          <tr><td colSpan={7} className="py-6 px-4 text-center text-sm text-neutral-400">No batting data</td></tr>
+          <tr><td colSpan={hasPid ? 8 : 7} className="py-6 px-4 text-center text-sm text-neutral-400">No batting data</td></tr>
         )}
         {rows.map((r, i) => (
           <tr key={i} className="border-t border-neutral-100 hover:bg-neutral-50/60">
+            {hasPid && <td className="py-2.5 px-4 text-xs font-mono text-neutral-500">{r.player_id}</td>}
             <td className="py-2.5 px-4 text-sm font-semibold text-neutral-900">{r.batter}</td>
             <td className="py-2.5 px-4 text-sm text-neutral-600">{r.dismissal}</td>
             <td className="py-2.5 px-4 text-sm font-mono text-neutral-900 text-right font-semibold">{r.runs}</td>
@@ -63,13 +67,17 @@ const BattingTable = ({ rows }) => (
       </tbody>
     </table>
   </div>
-);
+  );
+};
 
-const BowlingTable = ({ rows }) => (
+const BowlingTable = ({ rows }) => {
+  const hasPid = rows.some((r) => r.player_id);
+  return (
   <div data-testid={SCRAPER.bowlingTable} className="w-full overflow-x-auto border border-neutral-200 rounded-sm">
     <table className="w-full text-left border-collapse">
       <thead>
         <tr className="bg-neutral-50/80 text-xs font-semibold uppercase tracking-wider text-neutral-500">
+          {hasPid && <th className="py-2.5 px-4">Player ID</th>}
           <th className="py-2.5 px-4">Bowler</th>
           <th className="py-2.5 px-4 text-right">O</th>
           <th className="py-2.5 px-4 text-right">M</th>
@@ -82,10 +90,11 @@ const BowlingTable = ({ rows }) => (
       </thead>
       <tbody>
         {rows.length === 0 && (
-          <tr><td colSpan={8} className="py-6 px-4 text-center text-sm text-neutral-400">No bowling data</td></tr>
+          <tr><td colSpan={hasPid ? 9 : 8} className="py-6 px-4 text-center text-sm text-neutral-400">No bowling data</td></tr>
         )}
         {rows.map((r, i) => (
           <tr key={i} className="border-t border-neutral-100 hover:bg-neutral-50/60">
+            {hasPid && <td className="py-2.5 px-4 text-xs font-mono text-neutral-500">{r.player_id}</td>}
             <td className="py-2.5 px-4 text-sm font-semibold text-neutral-900">{r.bowler}</td>
             <td className="py-2.5 px-4 text-sm font-mono text-neutral-700 text-right">{r.overs}</td>
             <td className="py-2.5 px-4 text-sm font-mono text-neutral-700 text-right">{r.maidens}</td>
@@ -99,7 +108,8 @@ const BowlingTable = ({ rows }) => (
       </tbody>
     </table>
   </div>
-);
+  );
+};
 
 // ------------ Skeleton ------------
 const RowSkeleton = () => (

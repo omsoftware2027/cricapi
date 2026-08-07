@@ -164,6 +164,7 @@ def _scrape_cricheroes(url: str) -> dict:
             batting_rows = []
             for b in sc.get("batting") or []:
                 batting_rows.append({
+                    "player_id": str(b.get("player_id", "")),
                     "batter": (b.get("name") or "").strip(),
                     "dismissal": (b.get("how_to_out") or "").strip(),
                     "runs": str(b.get("runs", "")),
@@ -184,6 +185,7 @@ def _scrape_cricheroes(url: str) -> dict:
                 else:
                     overs_str = str(overs)
                 bowling_rows.append({
+                    "player_id": str(bw.get("player_id", "")),
                     "bowler": (bw.get("name") or "").strip(),
                     "overs": overs_str,
                     "maidens": str(bw.get("maidens", "")),
@@ -568,10 +570,10 @@ def scorecard_to_csv(sc: dict) -> str:
 
         # Batting
         w.writerow(["Batting"])
-        w.writerow(["Batter", "Dismissal", "R", "B", "4s", "6s", "SR"])
+        w.writerow(["CricHeroes Player ID", "Batter", "Dismissal", "R", "B", "4s", "6s", "SR"])
         for b in inn.get("batting", []):
             w.writerow([
-                b.get("batter", ""), b.get("dismissal", ""), b.get("runs", ""),
+                b.get("player_id", ""), b.get("batter", ""), b.get("dismissal", ""), b.get("runs", ""),
                 b.get("balls", ""), b.get("fours", ""), b.get("sixes", ""), b.get("sr", "")
             ])
         if inn.get("extras"):
@@ -586,10 +588,10 @@ def scorecard_to_csv(sc: dict) -> str:
 
         # Bowling
         w.writerow(["Bowling"])
-        w.writerow(["Bowler", "O", "M", "R", "W", "NB", "WD", "ECON"])
+        w.writerow(["CricHeroes Player ID", "Bowler", "O", "M", "R", "W", "NB", "WD", "ECON"])
         for bw in inn.get("bowling", []):
             w.writerow([
-                bw.get("bowler", ""), bw.get("overs", ""), bw.get("maidens", ""),
+                bw.get("player_id", ""), bw.get("bowler", ""), bw.get("overs", ""), bw.get("maidens", ""),
                 bw.get("runs", ""), bw.get("wickets", ""), bw.get("no_balls", ""),
                 bw.get("wides", ""), bw.get("econ", "")
             ])
