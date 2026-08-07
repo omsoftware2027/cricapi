@@ -171,12 +171,25 @@ const Preview = ({ data, onDownload }) => {
         <div className="mt-6">
           <h3 className="text-base font-semibold text-neutral-800 mb-3">Batting</h3>
           <BattingTable rows={innings[tab].batting || []} />
-          {(innings[tab].extras || innings[tab].total_line || innings[tab].did_not_bat || innings[tab].fall_of_wickets) && (
+          {(innings[tab].extras || innings[tab].total_line || innings[tab].did_not_bat || innings[tab].fall_of_wickets || (innings[tab].yet_to_bat && innings[tab].yet_to_bat.length > 0)) && (
             <div className="mt-3 grid gap-1 text-xs text-neutral-600">
               {innings[tab].total_line && <div><span className="text-neutral-500 font-semibold uppercase tracking-wider mr-2">Total</span>{innings[tab].total_line.replace(/^Total\s*/i,'')}</div>}
               {innings[tab].extras && <div><span className="text-neutral-500 font-semibold uppercase tracking-wider mr-2">Extras</span>{innings[tab].extras.replace(/^Extras\s*/i,'')}</div>}
-              {innings[tab].did_not_bat && <div><span className="text-neutral-500 font-semibold uppercase tracking-wider mr-2">DNB</span>{innings[tab].did_not_bat.replace(/^(Did not bat|Yet to bat)\s*/i,'')}</div>}
               {innings[tab].fall_of_wickets && <div className="break-words"><span className="text-neutral-500 font-semibold uppercase tracking-wider mr-2">FOW</span>{innings[tab].fall_of_wickets.replace(/^Fall of Wickets\s*/i,'')}</div>}
+              {innings[tab].yet_to_bat && innings[tab].yet_to_bat.length > 0 ? (
+                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <span className="text-neutral-500 font-semibold uppercase tracking-wider">Yet to Bat</span>
+                  {innings[tab].yet_to_bat.map((p, i) => (
+                    <span key={p.player_id || i} className="text-neutral-700">
+                      {p.name}
+                      {p.player_id && <span className="ml-1 font-mono text-[10px] text-neutral-400">#{p.player_id}</span>}
+                      {i < innings[tab].yet_to_bat.length - 1 && <span className="ml-2 text-neutral-300">·</span>}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                innings[tab].did_not_bat && <div><span className="text-neutral-500 font-semibold uppercase tracking-wider mr-2">DNB</span>{innings[tab].did_not_bat.replace(/^(Did not bat|Yet to bat)\s*:?\s*/i,'')}</div>
+              )}
             </div>
           )}
           <h3 className="text-base font-semibold text-neutral-800 mb-3 mt-8">Bowling</h3>

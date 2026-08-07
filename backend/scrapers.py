@@ -206,12 +206,21 @@ def _scrape_cricheroes(url: str) -> dict:
             if total_run != "":
                 total_line = f"Total {total_run}/{total_wicket} ({overs_played} Overs)"
 
-            # Yet to bat
+            # Yet to bat — cricheroes returns list of {player_id, name}
             dnb = sc.get("to_be_bat") or []
+            yet_to_bat_list = []
             dnb_str = ""
             if isinstance(dnb, list) and dnb:
-                names = [x.get("name","") if isinstance(x, dict) else str(x) for x in dnb]
-                dnb_str = "Yet to bat: " + ", ".join([n for n in names if n])
+                for x in dnb:
+                    if not isinstance(x, dict):
+                        continue
+                    pid = str(x.get("player_id") or "")
+                    nm = (x.get("name") or "").strip()
+                    if nm or pid:
+                        yet_to_bat_list.append({"player_id": pid, "name": nm})
+                names_only = [it["name"] for it in yet_to_bat_list if it["name"]]
+                if names_only:
+                    dnb_str = "Yet to bat: " + ", ".join(names_only)
 
             # Fall of wickets - cricheroes has a summary string ready to use
             fow_obj = sc.get("fall_of_wicket") or {}
@@ -232,6 +241,7 @@ def _scrape_cricheroes(url: str) -> dict:
                 "extras": extras_str,
                 "total_line": total_line,
                 "did_not_bat": dnb_str,
+                "yet_to_bat": yet_to_bat_list,
                 "fall_of_wickets": fow_str,
             })
 
@@ -580,10 +590,18 @@ def scorecard_to_csv(sc: dict) -> str:
             w.writerow([inn["extras"]])
         if inn.get("total_line"):
             w.writerow([inn["total_line"]])
-        if inn.get("did_not_bat"):
-            w.writerow([inn["did_not_bat"]])
         if inn.get("fall_of_wickets"):
             w.writerow([inn["fall_of_wickets"]])
+        # Yet to bat — structured with Player ID (cricheroes) or fallback text (other sources)
+        ytb = inn.get("yet_to_bat") or []
+        if ytb:
+            w.writerow([])
+            w.writerow(["Yet to Bat"])
+            w.writerow(["CricHeroes Player ID", "Name"])
+            for p in ytb:
+                w.writerow([p.get("player_id", ""), p.get("name", "")])
+        elif inn.get("did_not_bat"):
+            w.writerow([inn["did_not_bat"]])
         w.writerow([])
 
         # Bowling
