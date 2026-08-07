@@ -144,6 +144,98 @@ async def download_csv(sc_id: str):
     )
 
 
+def _scrape_and_build_csv(url: str, save: bool):
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+    try:
+        data = scrape(url)
+    except CloudflareBlocked as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("scrape failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+    csv_text = scorecard_to_csv(data)
+    safe_title = "".join(
+        c if c.isalnum() or c in "-_ " else "_" for c in (data.get("match_title") or "scorecard")
+    )[:80].strip() or "scorecard"
+    return csv_text, safe_title, data
+
+
+@api_router.get("/csv")
+async def scrape_to_csv_get(url: str, save: bool = True):
+    """Scrape a scorecard URL and return the CSV directly.
+
+    Example: GET /api/csv?url=https://cricheroes.com/scorecard/25954216/...
+    Optional query: ?save=false to skip persisting to history.
+    """
+    csv_text, safe_title, data = _scrape_and_build_csv(url, save)
+    if save:
+        sc = Scorecard(
+            url=data["url"], source=data["source"], match_title=data["match_title"],
+            result=data.get("result", ""), venue=data.get("venue", ""),
+            toss=data.get("toss", ""), innings=data.get("innings", []),
+        )
+        doc = sc.model_dump()
+        doc["scraped_at"] = sc.scraped_at.isoformat()
+        await db.scorecards.insert_one(doc)
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.csv"'},
+    )
+
+
+@api_router.post("/csv")
+async def scrape_to_csv_post(req: ScrapeRequest, save: bool = True):
+    """Same as GET /api/csv but takes {"url": "..."} as JSON body."""
+    csv_text, safe_title, data = _scrape_and_build_csv((req.url or "").strip(), save)
+    if save:
+        sc = Scorecard(
+            url=data["url"], source=data["source"], match_title=data["match_title"],
+            result=data.get("result", ""), venue=data.get("venue", ""),
+            toss=data.get("toss", ""), innings=data.get("innings", []),
+        )
+        doc = sc.model_dump()
+        doc["scraped_at"] = sc.scraped_at.isoformat()
+        await db.scorecards.insert_one(doc)
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.csv"'},
+    )
+
+
+@api_router.get("/cricheroes/{match_id}/csv")
+async def cricheroes_match_csv(match_id: str, save: bool = True):
+    """CricHeroes shortcut: pass just the numeric match_id and get the CSV.
+
+    Example: GET /api/cricheroes/25954216/csv
+    """
+    if not match_id.isdigit():
+        raise HTTPException(status_code=400, detail="match_id must be numeric")
+    url = f"https://cricheroes.com/scorecard/{match_id}/individual/match/live"
+    csv_text, safe_title, data = _scrape_and_build_csv(url, save)
+    if save:
+        sc = Scorecard(
+            url=data["url"], source=data["source"], match_title=data["match_title"],
+            result=data.get("result", ""), venue=data.get("venue", ""),
+            toss=data.get("toss", ""), innings=data.get("innings", []),
+        )
+        doc = sc.model_dump()
+        doc["scraped_at"] = sc.scraped_at.isoformat()
+        await db.scorecards.insert_one(doc)
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.csv"'},
+    )
+
+
+
 @api_router.delete("/scorecards/{sc_id}")
 async def delete_scorecard(sc_id: str):
     res = await db.scorecards.delete_one({"id": sc_id})

@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import "@/App.css";
 import axios from "axios";
 import { SCRAPER } from "@/constants/testIds";
-import { Download, Loader2, Trash2, Link2, Inbox, ChevronRight, AlertTriangle } from "lucide-react";
+import { Download, Loader2, Trash2, Link2, Inbox, ChevronRight, AlertTriangle, Terminal, Copy, Check } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -200,6 +200,54 @@ const Preview = ({ data, onDownload }) => {
   );
 };
 
+// ------------ ApiDocs ------------
+const CopyBtn = ({ text }) => {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={() => { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+      className="inline-flex items-center gap-1 text-[10px] text-neutral-500 hover:text-neutral-900 transition-colors"
+      aria-label="Copy"
+    >
+      {copied ? <><Check size={11}/> Copied</> : <><Copy size={11}/> Copy</>}
+    </button>
+  );
+};
+
+const Snippet = ({ label, body }) => (
+  <div className="border border-neutral-200 rounded-sm bg-neutral-50/50">
+    <div className="flex items-center justify-between px-3 py-2 border-b border-neutral-200 bg-white">
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">{label}</span>
+      <CopyBtn text={body}/>
+    </div>
+    <pre className="px-3 py-2 text-[11.5px] font-mono text-neutral-800 overflow-x-auto whitespace-pre">{body}</pre>
+  </div>
+);
+
+const ApiDocs = ({ backend }) => {
+  const sampleUrl = "https://cricheroes.com/scorecard/25954216/individual/x/live";
+  const encoded = encodeURIComponent(sampleUrl);
+  return (
+    <section data-testid="api-docs-panel" className="px-6 sm:px-10 pt-6 pb-2 border-b border-neutral-100 bg-neutral-50/30">
+      <div className="flex items-center gap-2 mb-3">
+        <Terminal size={14} className="text-[#BE123C]"/>
+        <h2 className="font-heading font-semibold text-neutral-900">Use as an API</h2>
+      </div>
+      <p className="text-sm text-neutral-600 mb-4 max-w-3xl">Pass a scorecard URL (or CricHeroes match id) and get the CSV back in one call. Use <code className="font-mono text-xs bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">?save=false</code> to skip history persistence.</p>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Snippet label="1. Any URL → CSV (GET)" body={`${backend}/api/csv?url=${encoded}`}/>
+        <Snippet label="2. CricHeroes match id → CSV (GET)" body={`${backend}/api/cricheroes/25954216/csv`}/>
+        <Snippet label="3. POST JSON body (any URL)" body={`curl -X POST "${backend}/api/csv" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url":"${sampleUrl}"}' \\
+  -o scorecard.csv`}/>
+        <Snippet label="4. Save to file (GET)" body={`curl -L "${backend}/api/cricheroes/25954216/csv" -o scorecard.csv`}/>
+      </div>
+      <p className="mt-4 text-[11px] text-neutral-500">Response: <code className="font-mono">text/csv</code> with <code className="font-mono">Content-Disposition: attachment</code>. Errors return <code className="font-mono">422</code> with a JSON <code className="font-mono">{`{detail}`}</code> body.</p>
+    </section>
+  );
+};
+
 // ------------ App ------------
 function App() {
   const [url, setUrl] = useState("");
@@ -207,6 +255,7 @@ function App() {
   const [error, setError] = useState("");
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
+  const [showApi, setShowApi] = useState(false);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -317,10 +366,21 @@ function App() {
 
       {/* Main */}
       <main className="flex-1 flex flex-col min-h-screen">
-        <header className="px-6 sm:px-10 pt-10 pb-6 border-b border-neutral-100">
-          <h1 className="font-heading text-2xl sm:text-3xl font-bold tracking-tight">Cricket Scorecard Scraper</h1>
-          <p className="mt-2 text-sm text-neutral-500 max-w-2xl">Paste a public Cricbuzz, ESPN Cricinfo or CricHeroes scorecard URL. Preview the batting &amp; bowling for every innings, then download the full match as a single CSV.</p>
+        <header className="px-6 sm:px-10 pt-10 pb-6 border-b border-neutral-100 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+          <div>
+            <h1 className="font-heading text-2xl sm:text-3xl font-bold tracking-tight">Cricket Scorecard Scraper</h1>
+            <p className="mt-2 text-sm text-neutral-500 max-w-2xl">Paste a public Cricbuzz, ESPN Cricinfo or CricHeroes scorecard URL. Preview the batting &amp; bowling for every innings, then download the full match as a single CSV.</p>
+          </div>
+          <button
+            data-testid="api-docs-btn"
+            onClick={() => setShowApi((v) => !v)}
+            className="shrink-0 inline-flex items-center gap-2 rounded-sm border border-neutral-200 bg-white text-neutral-900 font-medium px-4 py-2 text-sm hover:bg-neutral-50"
+          >
+            <Terminal size={14}/> {showApi ? "Hide API" : "Use as API"}
+          </button>
         </header>
+
+        {showApi && <ApiDocs backend={BACKEND_URL} />}
 
         <div className="px-6 sm:px-10 py-8">
           <form onSubmit={handleScrape} className="flex flex-col sm:flex-row gap-3 items-stretch">
