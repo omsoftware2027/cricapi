@@ -224,26 +224,43 @@ const Snippet = ({ label, body }) => (
   </div>
 );
 
-const ApiDocs = ({ backend }) => {
+const ApiDocs = ({ backend, authRequired }) => {
   const sampleUrl = "https://cricheroes.com/scorecard/25954216/individual/x/live";
   const encoded = encodeURIComponent(sampleUrl);
+  const authHdr = authRequired ? `  -H "Authorization: Bearer YOUR_TOKEN" \\\n` : "";
+  const authHdrShort = authRequired ? ` -H "Authorization: Bearer YOUR_TOKEN"` : "";
   return (
     <section data-testid="api-docs-panel" className="px-6 sm:px-10 pt-6 pb-2 border-b border-neutral-100 bg-neutral-50/30">
       <div className="flex items-center gap-2 mb-3">
         <Terminal size={14} className="text-[#BE123C]"/>
         <h2 className="font-heading font-semibold text-neutral-900">Use as an API</h2>
+        {authRequired ? (
+          <span className="ml-2 inline-flex items-center rounded-sm border border-amber-200 bg-amber-50 text-amber-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider">Bearer auth required</span>
+        ) : (
+          <span className="ml-2 inline-flex items-center rounded-sm border border-emerald-200 bg-emerald-50 text-emerald-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider">Open</span>
+        )}
       </div>
-      <p className="text-sm text-neutral-600 mb-4 max-w-3xl">Pass a scorecard URL (or CricHeroes match id) and get the CSV back in one call. Use <code className="font-mono text-xs bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">?save=false</code> to skip history persistence.</p>
+      <p className="text-sm text-neutral-600 mb-4 max-w-3xl">
+        Pass a scorecard URL (or CricHeroes match id) and get the CSV back in one call. Add <code className="font-mono text-xs bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">?save=false</code> to skip history persistence.
+        {authRequired && <> All endpoints require an <code className="font-mono">Authorization: Bearer &lt;token&gt;</code> or <code className="font-mono">X-API-Key: &lt;token&gt;</code> header.</>}
+      </p>
       <div className="grid gap-4 md:grid-cols-2">
-        <Snippet label="1. Any URL → CSV (GET)" body={`${backend}/api/csv?url=${encoded}`}/>
-        <Snippet label="2. CricHeroes match id → CSV (GET)" body={`${backend}/api/cricheroes/25954216/csv`}/>
+        <Snippet label="1. Any URL → CSV (GET)" body={authRequired
+          ? `curl -L "${backend}/api/csv?url=${encoded}"${authHdrShort} -o card.csv`
+          : `${backend}/api/csv?url=${encoded}`}/>
+        <Snippet label="2. CricHeroes match id → CSV (GET)" body={authRequired
+          ? `curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o card.csv`
+          : `${backend}/api/cricheroes/25954216/csv`}/>
         <Snippet label="3. POST JSON body (any URL)" body={`curl -X POST "${backend}/api/csv" \\
-  -H "Content-Type: application/json" \\
+${authHdr}  -H "Content-Type: application/json" \\
   -d '{"url":"${sampleUrl}"}' \\
   -o scorecard.csv`}/>
-        <Snippet label="4. Save to file (GET)" body={`curl -L "${backend}/api/cricheroes/25954216/csv" -o scorecard.csv`}/>
+        <Snippet label="4. Save to file (GET)" body={`curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o scorecard.csv`}/>
       </div>
-      <p className="mt-4 text-[11px] text-neutral-500">Response: <code className="font-mono">text/csv</code> with <code className="font-mono">Content-Disposition: attachment</code>. Errors return <code className="font-mono">422</code> with a JSON <code className="font-mono">{`{detail}`}</code> body.</p>
+      <p className="mt-4 text-[11px] text-neutral-500">Response: <code className="font-mono">text/csv</code> with <code className="font-mono">Content-Disposition: attachment</code>. Errors return <code className="font-mono">401</code> (bad token) or <code className="font-mono">422</code> (bad URL) with a JSON <code className="font-mono">{`{detail}`}</code> body.</p>
+      {!authRequired && (
+        <p className="mt-2 text-[11px] text-neutral-500">🔓 Auth is currently disabled. To turn it on, set <code className="font-mono bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">API_AUTH_TOKEN=your-secret</code> in <code className="font-mono">backend/.env</code> and restart the server.</p>
+      )}
     </section>
   );
 };
@@ -256,6 +273,11 @@ function App() {
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
   const [showApi, setShowApi] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+
+  useEffect(() => {
+    axios.get(`${API}/`).then((r) => setAuthRequired(!!r.data?.auth_required)).catch(() => {});
+  }, []);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -380,7 +402,7 @@ function App() {
           </button>
         </header>
 
-        {showApi && <ApiDocs backend={BACKEND_URL} />}
+        {showApi && <ApiDocs backend={BACKEND_URL} authRequired={authRequired} />}
 
         <div className="px-6 sm:px-10 py-8">
           <form onSubmit={handleScrape} className="flex flex-col sm:flex-row gap-3 items-stretch">

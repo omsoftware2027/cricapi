@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends
 from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -20,6 +20,29 @@ from scrapers import scrape, scorecard_to_csv, ScrapeError, CloudflareBlocked
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+# Optional bearer token protecting the /api/csv, /api/cricheroes/{id}/csv endpoints.
+# If unset/empty, the endpoints stay open (useful in preview & local dev).
+API_AUTH_TOKEN = os.environ.get('API_AUTH_TOKEN', '').strip()
+
+
+def require_api_token(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    if not API_AUTH_TOKEN:
+        return  # auth disabled
+    supplied = None
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    elif x_api_key:
+        supplied = x_api_key.strip()
+    if supplied != API_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API token. Send 'Authorization: Bearer <token>' or 'X-API-Key: <token>'.",
+        )
+
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -70,7 +93,10 @@ def _mongo_to_scorecard(doc: dict) -> dict:
 
 @api_router.get("/")
 async def root():
-    return {"message": "Cricket Scorecard Scraper API"}
+    return {
+        "message": "Cricket Scorecard Scraper API",
+        "auth_required": bool(API_AUTH_TOKEN),
+    }
 
 
 @api_router.post("/scrape", response_model=Scorecard)
@@ -166,7 +192,7 @@ def _scrape_and_build_csv(url: str, save: bool):
 
 
 @api_router.get("/csv")
-async def scrape_to_csv_get(url: str, save: bool = True):
+async def scrape_to_csv_get(url: str, save: bool = True, _auth: None = Depends(require_api_token)):
     """Scrape a scorecard URL and return the CSV directly.
 
     Example: GET /api/csv?url=https://cricheroes.com/scorecard/25954216/...
@@ -190,7 +216,7 @@ async def scrape_to_csv_get(url: str, save: bool = True):
 
 
 @api_router.post("/csv")
-async def scrape_to_csv_post(req: ScrapeRequest, save: bool = True):
+async def scrape_to_csv_post(req: ScrapeRequest, save: bool = True, _auth: None = Depends(require_api_token)):
     """Same as GET /api/csv but takes {"url": "..."} as JSON body."""
     csv_text, safe_title, data = _scrape_and_build_csv((req.url or "").strip(), save)
     if save:
@@ -210,7 +236,7 @@ async def scrape_to_csv_post(req: ScrapeRequest, save: bool = True):
 
 
 @api_router.get("/cricheroes/{match_id}/csv")
-async def cricheroes_match_csv(match_id: str, save: bool = True):
+async def cricheroes_match_csv(match_id: str, save: bool = True, _auth: None = Depends(require_api_token)):
     """CricHeroes shortcut: pass just the numeric match_id and get the CSV.
 
     Example: GET /api/cricheroes/25954216/csv
