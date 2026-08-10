@@ -225,13 +225,127 @@ const Snippet = ({ label, body }) => (
 );
 
 const ApiDocs = ({ backend, authRequired }) => {
+  const [tab, setTab] = useState("json");
   const sampleUrl = "https://cricheroes.com/scorecard/25954216/individual/x/live";
   const encoded = encodeURIComponent(sampleUrl);
-  const authHdr = authRequired ? `  -H "Authorization: Bearer YOUR_TOKEN" \\\n` : "";
+  const authHdrCurl = authRequired ? `  -H "Authorization: Bearer YOUR_TOKEN" \\\n` : "";
   const authHdrShort = authRequired ? ` -H "Authorization: Bearer YOUR_TOKEN"` : "";
+
+  const jsonSnippets = [
+    { label: "1. Match ID → JSON (GET)", body: authRequired
+      ? `curl "${backend}/api/cricheroes/25954216"${authHdrShort}`
+      : `${backend}/api/cricheroes/25954216` },
+    { label: "2. Any URL → JSON (GET)", body: authRequired
+      ? `curl "${backend}/api/json?url=${encoded}"${authHdrShort}`
+      : `${backend}/api/json?url=${encoded}` },
+    { label: "3. Lovable / fetch() → Supabase insert", body:
+`// Lovable action / Edge Function
+const token = "YOUR_TOKEN";
+const matchId = "25954216";
+
+const res = await fetch(\`${backend}/api/cricheroes/\${matchId}\`, {
+  headers: { Authorization: \`Bearer \${token}\` }
+});
+if (!res.ok) throw new Error(await res.text());
+const card = await res.json();
+
+// Insert one row per match into "matches"
+await supabase.from("matches").insert({
+  cricheroes_match_id: matchId,
+  title: card.match_title,
+  venue: card.venue,
+  toss: card.toss,
+  result: card.result,
+});
+
+// Flatten batting rows across all innings
+const batting = card.innings.flatMap((inn) =>
+  inn.batting.map((b) => ({
+    match_id: matchId,
+    innings: inn.innings_number,
+    team: inn.team,
+    player_id: b.player_id,
+    batter: b.batter,
+    dismissal: b.dismissal,
+    runs: Number(b.runs) || 0,
+    balls: Number(b.balls) || 0,
+    fours: Number(b.fours) || 0,
+    sixes: Number(b.sixes) || 0,
+    strike_rate: Number(b.sr) || 0,
+  }))
+);
+await supabase.from("batting_rows").insert(batting);
+
+// Flatten bowling rows
+const bowling = card.innings.flatMap((inn) =>
+  inn.bowling.map((b) => ({
+    match_id: matchId,
+    innings: inn.innings_number,
+    team: inn.team,
+    player_id: b.player_id,
+    bowler: b.bowler,
+    overs: b.overs,
+    maidens: Number(b.maidens) || 0,
+    runs: Number(b.runs) || 0,
+    wickets: Number(b.wickets) || 0,
+    economy: Number(b.econ) || 0,
+  }))
+);
+await supabase.from("bowling_rows").insert(bowling);` },
+    { label: "4. Response schema", body:
+`{
+  "source": "cricheroes",
+  "url": "...",
+  "match_title": "Team A vs Team B",
+  "result": "Team A won by 78 runs",
+  "venue": "...",
+  "toss": "...",
+  "innings": [
+    {
+      "innings_number": 1,
+      "team": "Team A",
+      "total": "142/12",
+      "overs": "23.0",
+      "batting": [
+        { "player_id": "7979305", "batter": "Vihaan G",
+          "dismissal": "b Arjun Yadav",
+          "runs": "22", "balls": "40", "fours": "1", "sixes": "0", "sr": "55.00" }
+      ],
+      "bowling": [
+        { "player_id": "50458833", "bowler": "Adhi Vijay Sai",
+          "overs": "3.0", "maidens": "0", "runs": "10", "wickets": "0",
+          "no_balls": "1", "wides": "0", "econ": "3.33" }
+      ],
+      "yet_to_bat": [ { "player_id": "8093609", "name": "Bhola" } ],
+      "extras": "Extras 67 (nb 12, wd 45, b 10)",
+      "total_line": "Total 142/12 (23.0 Overs)",
+      "fall_of_wickets": "Fall of Wickets: 8-1 (Vidhun, 3 ov), ..."
+    }
+  ]
+}` },
+  ];
+
+  const csvSnippets = [
+    { label: "1. Any URL → CSV (GET)", body: authRequired
+      ? `curl -L "${backend}/api/csv?url=${encoded}"${authHdrShort} -o card.csv`
+      : `${backend}/api/csv?url=${encoded}` },
+    { label: "2. CricHeroes match id → CSV (GET)", body: authRequired
+      ? `curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o card.csv`
+      : `${backend}/api/cricheroes/25954216/csv` },
+    { label: "3. POST JSON body (any URL)", body:
+`curl -X POST "${backend}/api/csv" \\
+${authHdrCurl}  -H "Content-Type: application/json" \\
+  -d '{"url":"${sampleUrl}"}' \\
+  -o scorecard.csv` },
+    { label: "4. Save to file (GET)", body:
+`curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o scorecard.csv` },
+  ];
+
+  const active = tab === "json" ? jsonSnippets : csvSnippets;
+
   return (
     <section data-testid="api-docs-panel" className="px-6 sm:px-10 pt-6 pb-2 border-b border-neutral-100 bg-neutral-50/30">
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex flex-wrap items-center gap-2 mb-3">
         <Terminal size={14} className="text-[#BE123C]"/>
         <h2 className="font-heading font-semibold text-neutral-900">Use as an API</h2>
         {authRequired ? (
@@ -239,25 +353,34 @@ const ApiDocs = ({ backend, authRequired }) => {
         ) : (
           <span className="ml-2 inline-flex items-center rounded-sm border border-emerald-200 bg-emerald-50 text-emerald-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider">Open</span>
         )}
+        <div className="ml-auto inline-flex items-center border border-neutral-200 rounded-sm bg-white p-0.5">
+          {[
+            { k: "json", label: "JSON" },
+            { k: "csv", label: "CSV" },
+          ].map((t) => (
+            <button
+              key={t.k}
+              data-testid={`api-tab-${t.k}`}
+              onClick={() => setTab(t.k)}
+              className={`px-3 py-1 text-xs font-medium rounded-sm transition-colors ${tab === t.k ? "bg-[#BE123C] text-white" : "text-neutral-600 hover:text-neutral-900"}`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
       <p className="text-sm text-neutral-600 mb-4 max-w-3xl">
-        Pass a scorecard URL (or CricHeroes match id) and get the CSV back in one call. Add <code className="font-mono text-xs bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">?save=false</code> to skip history persistence.
+        {tab === "json" ? (
+          <>Nested JSON response, perfect for storing in Supabase / Firebase / any DB. Best pick for Lovable-style apps that want to normalise rows into their own schema.</>
+        ) : (
+          <>Downloadable CSV with <code className="font-mono text-xs bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">Content-Disposition: attachment</code>. Best for spreadsheets and browser downloads.</>
+        )}
         {authRequired && <> All endpoints require an <code className="font-mono">Authorization: Bearer &lt;token&gt;</code> or <code className="font-mono">X-API-Key: &lt;token&gt;</code> header.</>}
       </p>
       <div className="grid gap-4 md:grid-cols-2">
-        <Snippet label="1. Any URL → CSV (GET)" body={authRequired
-          ? `curl -L "${backend}/api/csv?url=${encoded}"${authHdrShort} -o card.csv`
-          : `${backend}/api/csv?url=${encoded}`}/>
-        <Snippet label="2. CricHeroes match id → CSV (GET)" body={authRequired
-          ? `curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o card.csv`
-          : `${backend}/api/cricheroes/25954216/csv`}/>
-        <Snippet label="3. POST JSON body (any URL)" body={`curl -X POST "${backend}/api/csv" \\
-${authHdr}  -H "Content-Type: application/json" \\
-  -d '{"url":"${sampleUrl}"}' \\
-  -o scorecard.csv`}/>
-        <Snippet label="4. Save to file (GET)" body={`curl -L "${backend}/api/cricheroes/25954216/csv"${authHdrShort} -o scorecard.csv`}/>
+        {active.map((s) => <Snippet key={s.label} label={s.label} body={s.body}/>)}
       </div>
-      <p className="mt-4 text-[11px] text-neutral-500">Response: <code className="font-mono">text/csv</code> with <code className="font-mono">Content-Disposition: attachment</code>. Errors return <code className="font-mono">401</code> (bad token) or <code className="font-mono">422</code> (bad URL) with a JSON <code className="font-mono">{`{detail}`}</code> body.</p>
+      <p className="mt-4 text-[11px] text-neutral-500">Errors return <code className="font-mono">401</code> (bad token), <code className="font-mono">422</code> (bad URL) or <code className="font-mono">500</code> with a JSON <code className="font-mono">{`{detail}`}</code> body.</p>
       {!authRequired && (
         <p className="mt-2 text-[11px] text-neutral-500">🔓 Auth is currently disabled. To turn it on, set <code className="font-mono bg-white border border-neutral-200 px-1.5 py-0.5 rounded-sm">API_AUTH_TOKEN=your-secret</code> in <code className="font-mono">backend/.env</code> and restart the server.</p>
       )}

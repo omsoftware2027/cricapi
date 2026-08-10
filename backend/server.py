@@ -261,6 +261,56 @@ async def cricheroes_match_csv(match_id: str, save: bool = True, _auth: None = D
     )
 
 
+# ---------------- JSON endpoints (for API consumers like Supabase / Lovable) ----------------
+
+def _scrape_json_only(url: str):
+    """Scrape a URL and return the nested-JSON payload (no DB save)."""
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+    try:
+        return scrape(url)
+    except CloudflareBlocked as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("scrape failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.get("/json")
+async def scrape_to_json_get(url: str, _auth: None = Depends(require_api_token)):
+    """Scrape any supported URL and return nested JSON (does NOT save to history).
+
+    Example: GET /api/json?url=https://cricheroes.com/scorecard/25954216/...
+    Response shape: {source, url, match_title, result, venue, toss, innings: [{
+        innings_number, team, total, overs, batting: [{player_id, batter, dismissal, runs, balls, fours, sixes, sr}],
+        bowling: [{player_id, bowler, overs, maidens, runs, wickets, no_balls, wides, econ}],
+        yet_to_bat: [{player_id, name}], extras, total_line, fall_of_wickets
+    }]}
+    """
+    return _scrape_json_only(url)
+
+
+@api_router.post("/json")
+async def scrape_to_json_post(req: ScrapeRequest, _auth: None = Depends(require_api_token)):
+    """Same as GET /api/json but takes {"url": "..."} as JSON body."""
+    return _scrape_json_only((req.url or "").strip())
+
+
+@api_router.get("/cricheroes/{match_id}")
+async def cricheroes_match_json(match_id: str, _auth: None = Depends(require_api_token)):
+    """CricHeroes shortcut: pass just the numeric match_id and get nested JSON.
+
+    Example: GET /api/cricheroes/25954216
+    """
+    if not match_id.isdigit():
+        raise HTTPException(status_code=400, detail="match_id must be numeric")
+    url = f"https://cricheroes.com/scorecard/{match_id}/individual/match/live"
+    return _scrape_json_only(url)
+
 
 @api_router.delete("/scorecards/{sc_id}")
 async def delete_scorecard(sc_id: str):
