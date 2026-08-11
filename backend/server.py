@@ -54,6 +54,10 @@ class ScrapeRequest(BaseModel):
     url: str
 
 
+class BatchRequest(BaseModel):
+    match_ids: List[str]
+    urls: Optional[List[str]] = None  # optional alternative to match_ids
+
 class ScorecardListItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
@@ -310,6 +314,87 @@ async def cricheroes_match_json(match_id: str, _auth: None = Depends(require_api
         raise HTTPException(status_code=400, detail="match_id must be numeric")
     url = f"https://cricheroes.com/scorecard/{match_id}/individual/match/live"
     return _scrape_json_only(url)
+
+
+# ---------------- Batch endpoint ----------------
+
+MAX_BATCH = 50
+BATCH_CONCURRENCY = 5
+
+
+async def _scrape_one_safe(url: str, key: str) -> dict:
+    """Run scrape() in a thread and return either data or an error entry."""
+    import asyncio
+    try:
+        data = await asyncio.to_thread(scrape, url)
+        return {"key": key, "url": url, "ok": True, "data": data}
+    except CloudflareBlocked as e:
+        return {"key": key, "url": url, "ok": False, "error": str(e), "status": 422}
+    except ScrapeError as e:
+        return {"key": key, "url": url, "ok": False, "error": str(e), "status": 422}
+    except Exception as e:
+        logger.exception("batch scrape failed for %s", url)
+        return {"key": key, "url": url, "ok": False, "error": str(e), "status": 500}
+
+
+@api_router.post("/cricheroes/batch")
+async def cricheroes_batch(req: BatchRequest, _auth: None = Depends(require_api_token)):
+    """Scrape many CricHeroes matches in one call.
+
+    Body: {"match_ids": ["25954216", "25954217", ...]}
+    Or   : {"urls": ["https://cricheroes.com/scorecard/25954216/...", ...]}
+
+    Response: {
+      "total": N, "successful": M, "failed": N-M,
+      "results": [{key, url, ok, data|error, status?}, ...]
+    }
+    Each result preserves input order. Runs up to 5 requests concurrently.
+    """
+    import asyncio
+
+    tasks: List = []
+    seen: set = set()
+    for mid in (req.match_ids or []):
+        mid = str(mid).strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        if not mid.isdigit():
+            tasks.append(asyncio.sleep(0, result={"key": mid, "url": "", "ok": False, "error": "match_id must be numeric", "status": 400}))
+            continue
+        url = f"https://cricheroes.com/scorecard/{mid}/individual/match/live"
+        tasks.append(_scrape_one_safe(url, mid))
+
+    for u in (req.urls or []):
+        u = str(u).strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        if not (u.startswith("http://") or u.startswith("https://")):
+            tasks.append(asyncio.sleep(0, result={"key": u, "url": u, "ok": False, "error": "url must start with http(s)://", "status": 400}))
+            continue
+        tasks.append(_scrape_one_safe(u, u))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="Provide match_ids or urls (non-empty).")
+    if len(tasks) > MAX_BATCH:
+        raise HTTPException(status_code=400, detail=f"Batch size {len(tasks)} exceeds max {MAX_BATCH}.")
+
+    # Limit concurrency
+    sem = asyncio.Semaphore(BATCH_CONCURRENCY)
+
+    async def guarded(t):
+        async with sem:
+            return await t
+
+    results = await asyncio.gather(*[guarded(t) for t in tasks])
+    successful = sum(1 for r in results if r.get("ok"))
+    return {
+        "total": len(results),
+        "successful": successful,
+        "failed": len(results) - successful,
+        "results": results,
+    }
 
 
 @api_router.delete("/scorecards/{sc_id}")

@@ -235,91 +235,61 @@ const ApiDocs = ({ backend, authRequired }) => {
     { label: "1. Match ID → JSON (GET)", body: authRequired
       ? `curl "${backend}/api/cricheroes/25954216"${authHdrShort}`
       : `${backend}/api/cricheroes/25954216` },
-    { label: "2. Any URL → JSON (GET)", body: authRequired
-      ? `curl "${backend}/api/json?url=${encoded}"${authHdrShort}`
-      : `${backend}/api/json?url=${encoded}` },
-    { label: "3. Lovable / fetch() → Supabase insert", body:
-`// Lovable action / Edge Function
-const token = "YOUR_TOKEN";
-const matchId = "25954216";
+    { label: "2. Batch: many match ids → JSON (POST)", body:
+`curl -X POST "${backend}/api/cricheroes/batch" \\
+${authHdrCurl}  -H "Content-Type: application/json" \\
+  -d '{"match_ids":["25954216","25954217","25954218"]}'` },
+    { label: "3. Lovable batch import → Supabase", body:
+`const TOKEN = "YOUR_TOKEN";
+const API = "${backend}";
 
-const res = await fetch(\`${backend}/api/cricheroes/\${matchId}\`, {
-  headers: { Authorization: \`Bearer \${token}\` }
-});
-if (!res.ok) throw new Error(await res.text());
-const card = await res.json();
+// Pass any number of ids (max 50 per call, ~5 scraped in parallel)
+async function importMatches(matchIds) {
+  const r = await fetch(\`\${API}/api/cricheroes/batch\`, {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${TOKEN}\`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ match_ids: matchIds }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const { results } = await r.json();
 
-// Insert one row per match into "matches"
-await supabase.from("matches").insert({
-  cricheroes_match_id: matchId,
-  title: card.match_title,
-  venue: card.venue,
-  toss: card.toss,
-  result: card.result,
-});
+  for (const item of results) {
+    if (!item.ok) {
+      console.warn("skip", item.key, item.error);
+      continue;
+    }
+    const card = item.data;
+    await supabase.from("matches").upsert({
+      cricheroes_match_id: item.key,
+      title: card.match_title, venue: card.venue,
+      toss: card.toss, result: card.result,
+    });
+    // ...flatten batting/bowling into their tables (see single-match snippet)
+  }
+}
 
-// Flatten batting rows across all innings
-const batting = card.innings.flatMap((inn) =>
-  inn.batting.map((b) => ({
-    match_id: matchId,
-    innings: inn.innings_number,
-    team: inn.team,
-    player_id: b.player_id,
-    batter: b.batter,
-    dismissal: b.dismissal,
-    runs: Number(b.runs) || 0,
-    balls: Number(b.balls) || 0,
-    fours: Number(b.fours) || 0,
-    sixes: Number(b.sixes) || 0,
-    strike_rate: Number(b.sr) || 0,
-  }))
-);
-await supabase.from("batting_rows").insert(batting);
-
-// Flatten bowling rows
-const bowling = card.innings.flatMap((inn) =>
-  inn.bowling.map((b) => ({
-    match_id: matchId,
-    innings: inn.innings_number,
-    team: inn.team,
-    player_id: b.player_id,
-    bowler: b.bowler,
-    overs: b.overs,
-    maidens: Number(b.maidens) || 0,
-    runs: Number(b.runs) || 0,
-    wickets: Number(b.wickets) || 0,
-    economy: Number(b.econ) || 0,
-  }))
-);
-await supabase.from("bowling_rows").insert(bowling);` },
-    { label: "4. Response schema", body:
+// importMatches(["25954216","25954217","25954218"]);` },
+    { label: "4. Batch response shape", body:
 `{
-  "source": "cricheroes",
-  "url": "...",
-  "match_title": "Team A vs Team B",
-  "result": "Team A won by 78 runs",
-  "venue": "...",
-  "toss": "...",
-  "innings": [
+  "total": 3,
+  "successful": 2,
+  "failed": 1,
+  "results": [
     {
-      "innings_number": 1,
-      "team": "Team A",
-      "total": "142/12",
-      "overs": "23.0",
-      "batting": [
-        { "player_id": "7979305", "batter": "Vihaan G",
-          "dismissal": "b Arjun Yadav",
-          "runs": "22", "balls": "40", "fours": "1", "sixes": "0", "sr": "55.00" }
-      ],
-      "bowling": [
-        { "player_id": "50458833", "bowler": "Adhi Vijay Sai",
-          "overs": "3.0", "maidens": "0", "runs": "10", "wickets": "0",
-          "no_balls": "1", "wides": "0", "econ": "3.33" }
-      ],
-      "yet_to_bat": [ { "player_id": "8093609", "name": "Bhola" } ],
-      "extras": "Extras 67 (nb 12, wd 45, b 10)",
-      "total_line": "Total 142/12 (23.0 Overs)",
-      "fall_of_wickets": "Fall of Wickets: 8-1 (Vidhun, 3 ov), ..."
+      "key": "25954216",
+      "url": "https://cricheroes.com/scorecard/25954216/individual/match/live",
+      "ok": true,
+      "data": { /* same nested JSON as single-match endpoint */ }
+    },
+    {
+      "key": "abc",
+      "url": "",
+      "ok": false,
+      "status": 400,
+      "error": "match_id must be numeric"
     }
   ]
 }` },
