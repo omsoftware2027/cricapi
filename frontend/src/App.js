@@ -55,15 +55,39 @@ const DocsPage = () => {
     { label: "1. Single match → JSON (GET)", body:
 `curl "${base}/api/cricheroes/25954216" \\
   -H "Authorization: Bearer YOUR_TOKEN"` },
-    { label: "2. Batch: many match ids → JSON (POST)", body:
+    { label: "2. Whole tournament → JSON (GET)", body:
+`curl "${base}/api/cricheroes/tournament/1?include_scorecards=true&scorecard_limit=100" \\
+  -H "Authorization: Bearer YOUR_TOKEN"` },
+    { label: "3. Batch: many match ids → JSON (POST)", body:
 `curl -X POST "${base}/api/cricheroes/batch" \\
   -H "Authorization: Bearer YOUR_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{"match_ids":["25954216","25954217","25954218"]}'` },
-    { label: "3. Any scorecard URL → JSON (GET)", body:
+    { label: "4. Any scorecard or tournament URL → JSON (GET)", body:
 `curl "${base}/api/json?url=${encoded}" \\
   -H "Authorization: Bearer YOUR_TOKEN"` },
-    { label: "4. Batch response shape", body:
+    { label: "5. Tournament response shape", body:
+`{
+  "kind": "tournament",
+  "tournament_id": "1",
+  "tournament": { "name": "Digicorp Cricket League 2016", "match_count": 4 },
+  "teams": [ { "team_id": "43233", "team_name": "DG Lions" } ],
+  "standings": [ { "team_name": "DG Panthers", "points": 4, "net_rr": "0.985" } ],
+  "total_matches": 4,
+  "incomplete": false,
+  "matches": [
+    {
+      "match_id": "119",
+      "status": "past",
+      "team_a": "DG Panthers",
+      "team_b": "DG Lions",
+      "result": "5 wickets",
+      "ok": true,
+      "scorecard": { "match_title": "DG Panthers vs DG Lions", "innings": [] }
+    }
+  ]
+}` },
+    { label: "6. Batch response shape", body:
 `{
   "total": 3,
   "successful": 2,
@@ -114,15 +138,19 @@ const DocsPage = () => {
   ];
 
   const csvSnippets = [
-    { label: "1. Single match → CSV file", body:
+    { label: "1. Whole tournament → one CSV", body:
+`curl -L "${base}/api/cricheroes/tournament/1/csv" \\
+  -H "Authorization: Bearer YOUR_TOKEN" \\
+  -o tournament.csv` },
+    { label: "2. Single match → CSV file", body:
 `curl -L "${base}/api/cricheroes/25954216/csv" \\
   -H "Authorization: Bearer YOUR_TOKEN" \\
   -o scorecard.csv` },
-    { label: "2. Any scorecard URL → CSV", body:
+    { label: "3. Any scorecard URL → CSV", body:
 `curl -L "${base}/api/csv?url=${encoded}" \\
   -H "Authorization: Bearer YOUR_TOKEN" \\
   -o scorecard.csv` },
-    { label: "3. POST body (any URL) → CSV", body:
+    { label: "4. POST body (any URL) → CSV", body:
 `curl -X POST "${base}/api/csv" \\
   -H "Authorization: Bearer YOUR_TOKEN" \\
   -H "Content-Type: application/json" \\
@@ -234,7 +262,7 @@ export async function importMatches(matchIds: string[]) {
         </div>
         <p className="text-sm text-neutral-600 mb-4 max-w-3xl">
           {tab === "json"
-            ? "Nested JSON, ideal for storing in Supabase / Firebase / any DB. Batch endpoint scrapes up to 50 match ids in parallel."
+            ? "Nested JSON, ideal for storing in Supabase / Firebase / any DB. Pass a tournament id to scrape every match in that tournament, or batch up to 50 match ids."
             : "Downloadable CSV with Content-Disposition: attachment. Best for spreadsheets and one-off downloads."}
         </p>
 
@@ -256,7 +284,7 @@ export async function importMatches(matchIds: string[]) {
           <h3 className="font-heading text-sm font-semibold text-neutral-900 mb-3">Errors</h3>
           <ul className="text-xs text-neutral-600 space-y-1 font-mono">
             <li><span className="text-neutral-400">401</span> — missing or invalid bearer token</li>
-            <li><span className="text-neutral-400">400</span> — malformed request (bad match_id, empty batch, batch &gt; 50)</li>
+            <li><span className="text-neutral-400">400</span> — malformed request (bad match_id or tournament_id, empty batch, batch &gt; 50)</li>
             <li><span className="text-neutral-400">422</span> — the target site returned no data or a CricHeroes-side error</li>
             <li><span className="text-neutral-400">500</span> — unexpected server error</li>
           </ul>

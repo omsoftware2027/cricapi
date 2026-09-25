@@ -18,7 +18,14 @@ from typing import List, Optional
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from scrapers import scrape, scorecard_to_csv, ScrapeError, CloudflareBlocked  # noqa: E402
+from scrapers import (  # noqa: E402
+    scrape,
+    scrape_tournament,
+    scorecard_to_csv,
+    tournament_to_csv,
+    ScrapeError,
+    CloudflareBlocked,
+)
 
 
 # ---------------- Auth ----------------
@@ -63,6 +70,12 @@ class BatchRequest(BaseModel):
     urls: Optional[List[str]] = None
 
 
+class TournamentQuery(BaseModel):
+    tournament_id: str
+    include_scorecards: bool = True
+    scorecard_limit: int = 100
+
+
 # ---------------- Health ----------------
 
 @api_router.get("/")
@@ -79,6 +92,8 @@ async def root():
             "any_url_csv_get": "GET /api/csv?url=...",
             "any_url_csv_post": "POST /api/csv  {url}",
             "batch": "POST /api/cricheroes/batch  {match_ids[] | urls[]}",
+            "tournament_json": "GET /api/cricheroes/tournament/{tournament_id}",
+            "tournament_csv": "GET /api/cricheroes/tournament/{tournament_id}/csv",
         },
     }
 
@@ -102,9 +117,14 @@ def _scrape_or_400(url: str) -> dict:
 
 
 def _csv_response(data: dict) -> PlainTextResponse:
-    csv_text = scorecard_to_csv(data)
+    if data.get("kind") == "tournament":
+        csv_text = tournament_to_csv(data)
+        title_source = (data.get("tournament") or {}).get("name") or f"tournament-{data.get('tournament_id')}"
+    else:
+        csv_text = scorecard_to_csv(data)
+        title_source = data.get("match_title") or "scorecard"
     safe_title = "".join(
-        c if c.isalnum() or c in "-_ " else "_" for c in (data.get("match_title") or "scorecard")
+        c if c.isalnum() or c in "-_ " else "_" for c in title_source
     )[:80].strip() or "scorecard"
     return PlainTextResponse(
         csv_text,
@@ -155,6 +175,48 @@ async def cricheroes_csv(match_id: str, _auth: None = Depends(require_api_token)
     if not match_id.isdigit():
         raise HTTPException(status_code=400, detail="match_id must be numeric")
     return _csv_response(_scrape_or_400(_cricheroes_url(match_id)))
+
+
+def _tournament_or_400(tournament_id: str, include_scorecards: bool, scorecard_limit: int) -> dict:
+    if not str(tournament_id).isdigit():
+        raise HTTPException(status_code=400, detail="tournament_id must be numeric")
+    try:
+        return scrape_tournament(
+            tournament_id,
+            include_scorecards=include_scorecards,
+            scorecard_limit=scorecard_limit,
+        )
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("tournament scrape failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.get("/cricheroes/tournament/{tournament_id}")
+async def cricheroes_tournament_json(
+    tournament_id: str,
+    include_scorecards: bool = True,
+    scorecard_limit: int = 100,
+    _auth: None = Depends(require_api_token),
+):
+    """Every match in a CricHeroes tournament, plus teams, points table, and scorecards."""
+    return _tournament_or_400(tournament_id, include_scorecards, scorecard_limit)
+
+
+@api_router.get("/cricheroes/tournament/{tournament_id}/csv")
+async def cricheroes_tournament_csv(
+    tournament_id: str,
+    include_scorecards: bool = True,
+    scorecard_limit: int = 100,
+    _auth: None = Depends(require_api_token),
+):
+    return _csv_response(_tournament_or_400(tournament_id, include_scorecards, scorecard_limit))
+
+
+@api_router.post("/cricheroes/tournament")
+async def cricheroes_tournament_post(req: TournamentQuery, _auth: None = Depends(require_api_token)):
+    return _tournament_or_400(req.tournament_id, req.include_scorecards, req.scorecard_limit)
 
 
 # ---------------- Batch ----------------

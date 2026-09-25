@@ -4,6 +4,7 @@ Supports: Cricbuzz, ESPN Cricinfo, Cricheroes (via Bright Data residential proxy
 """
 from __future__ import annotations
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -60,6 +61,9 @@ def detect_source(url: str) -> str:
 def scrape(url: str) -> dict:
     src = detect_source(url)
     if src == "cricheroes":
+        tournament_id = _cricheroes_tournament_id(url)
+        if tournament_id:
+            return scrape_tournament(tournament_id)
         # CricHeroes has its own API path; no HTML fetch needed
         return _scrape_cricheroes(url)
     html = _fetch_html(url)
@@ -75,11 +79,77 @@ def scrape(url: str) -> dict:
 # --------------------------- CRICHEROES ---------------------------
 
 _CRICHEROES_MATCH_RE = re.compile(r"/scorecard/(\d+)")
+_CRICHEROES_TOURNAMENT_RE = re.compile(r"/tournament/(\d+)")
+
+# Team match history is paged. Stop walking a team once the tournament is
+# fully collected, or after this many pages, whichever comes first.
+_TEAM_MATCH_PAGE_CAP = 40
+_DEFAULT_SCORECARD_LIMIT = 100
+_MAX_SCORECARD_LIMIT = 200
 
 
 def _cricheroes_match_id(url: str) -> Optional[str]:
     m = _CRICHEROES_MATCH_RE.search(url)
     return m.group(1) if m else None
+
+
+def _cricheroes_tournament_id(url: str) -> Optional[str]:
+    m = _CRICHEROES_TOURNAMENT_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _cricheroes_headers() -> dict:
+    return {
+        "User-Agent": CRICHEROES_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://cricheroes.com",
+        "Referer": "https://cricheroes.com/",
+        "api-key": CRICHEROES_API_KEY,
+        "udid": CRICHEROES_UDID,
+        "device-type": "Chrome: 128.0.0.0",
+    }
+
+
+def _cricheroes_api_get(path: str) -> dict:
+    """GET a CricHeroes JSON route. Uses the Bright Data proxy when configured,
+    then falls back to a direct request if the proxy is missing or rejects this host.
+    """
+    api_url = path if path.startswith("http") else f"{CRICHEROES_API_BASE}{path if path.startswith('/') else '/' + path}"
+    headers = _cricheroes_headers()
+    attempts = []
+    proxy = brightdata_proxy_url()
+    if proxy:
+        attempts.append({"proxies": {"http": proxy, "https": proxy}, "verify": False})
+    attempts.append({})
+
+    last_error: Optional[Exception] = None
+    for extra in attempts:
+        try:
+            r = _requests.get(api_url, headers=headers, timeout=90, **extra)
+        except Exception as e:
+            last_error = e
+            continue
+        if r.status_code != 200:
+            last_error = ScrapeError(f"CricHeroes API returned HTTP {r.status_code}.")
+            continue
+        try:
+            payload = r.json()
+        except ValueError:
+            last_error = ScrapeError("CricHeroes API returned invalid JSON.")
+            continue
+        if not isinstance(payload, dict):
+            last_error = ScrapeError("CricHeroes API returned an unexpected payload.")
+            continue
+        return payload
+
+    if isinstance(last_error, ScrapeError):
+        raise last_error
+    if not proxy:
+        raise ScrapeError(
+            "CricHeroes is Cloudflare-protected. A Bright Data residential proxy is required. "
+            "Please configure BRIGHTDATA_PROXY_USER and BRIGHTDATA_PROXY_PASS on the server."
+        )
+    raise ScrapeError(f"Failed to reach CricHeroes via proxy: {last_error}")
 
 
 def _scrape_cricheroes(url: str) -> dict:
@@ -90,40 +160,7 @@ def _scrape_cricheroes(url: str) -> dict:
             "It should look like https://cricheroes.com/scorecard/<match_id>/..."
         )
 
-    proxy = brightdata_proxy_url()
-    if not proxy:
-        raise ScrapeError(
-            "CricHeroes is Cloudflare-protected. A Bright Data residential proxy is required. "
-            "Please configure BRIGHTDATA_PROXY_USER and BRIGHTDATA_PROXY_PASS on the server."
-        )
-
-    api_url = f"{CRICHEROES_API_BASE}/scorecard/get-scorecard/{match_id}"
-    headers = {
-        "User-Agent": CRICHEROES_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://cricheroes.com",
-        "Referer": "https://cricheroes.com/",
-        "api-key": CRICHEROES_API_KEY,
-        "udid": CRICHEROES_UDID,
-        "device-type": "Chrome: 128.0.0.0",
-    }
-    try:
-        r = _requests.get(
-            api_url,
-            headers=headers,
-            proxies={"http": proxy, "https": proxy},
-            verify=False,
-            timeout=90,
-        )
-    except Exception as e:
-        raise ScrapeError(f"Failed to reach CricHeroes via proxy: {e}")
-
-    if r.status_code != 200:
-        raise ScrapeError(f"CricHeroes API returned HTTP {r.status_code}.")
-    try:
-        payload = r.json()
-    except ValueError:
-        raise ScrapeError("CricHeroes API returned invalid JSON.")
+    payload = _cricheroes_api_get(f"/scorecard/get-scorecard/{match_id}")
     if not payload.get("status"):
         err = (payload.get("error") or {}).get("message") or "Unknown error"
         raise ScrapeError(f"CricHeroes API error: {err}")
@@ -258,6 +295,266 @@ def _scrape_cricheroes(url: str) -> dict:
         "venue": venue,
         "toss": toss,
         "innings": innings_list,
+    }
+
+
+# --------------------------- CRICHEROES TOURNAMENT ---------------------------
+
+def _api_error_message(payload: dict, fallback: str) -> str:
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+    return fallback
+
+
+def _as_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _tournament_summary(detail: dict) -> dict:
+    grounds = []
+    for g in _as_list(detail.get("grounds")):
+        if not isinstance(g, dict):
+            continue
+        grounds.append({
+            "ground_id": str(g.get("ground_id") or ""),
+            "ground_name": g.get("ground_name") or "",
+            "city_name": g.get("city_name") or "",
+        })
+    return {
+        "tournament_id": str(detail.get("tournament_id") or ""),
+        "name": detail.get("name") or "",
+        "city": detail.get("city_name") or "",
+        "from_date": detail.get("from_date") or "",
+        "to_date": detail.get("to_date") or "",
+        "ball_type": detail.get("ball_type") or "",
+        "category": detail.get("tournament_category") or detail.get("category") or "",
+        "tournament_type": detail.get("tournament_type") or "",
+        "match_count": int(detail.get("match_count") or 0),
+        "live_matches_count": int(detail.get("live_matches_count") or 0),
+        "past_matches_count": int(detail.get("past_matches_count") or 0),
+        "upcoming_matches_count": int(detail.get("upcoming_matches_count") or 0),
+        "logo": detail.get("tournament_logo") or detail.get("logo") or "",
+        "share_url": detail.get("share_url") or "",
+        "grounds": grounds,
+    }
+
+
+def _team_summary(team: dict) -> dict:
+    return {
+        "team_id": str(team.get("team_id") or ""),
+        "team_name": team.get("team_name") or "",
+        "city_name": team.get("city_name") or "",
+        "logo": team.get("logo") or "",
+    }
+
+
+def _standing_rows(payload: dict) -> list:
+    rows = []
+    for group in _as_list(payload.get("data")):
+        if not isinstance(group, dict):
+            continue
+        group_name = group.get("group") or ""
+        for row in _as_list(group.get("standing")):
+            if not isinstance(row, dict):
+                continue
+            rows.append({
+                "group": row.get("group") or group_name,
+                "round_name": row.get("round_name") or "",
+                "team_id": str(row.get("team_id") or ""),
+                "team_name": row.get("team_name") or "",
+                "matches": row.get("matches", ""),
+                "won": row.get("won", ""),
+                "lost": row.get("lost", ""),
+                "drawn": row.get("drawn", ""),
+                "tied": row.get("tied", ""),
+                "no_result": row.get("no_result", ""),
+                "points": row.get("points", ""),
+                "net_rr": row.get("net_rr", ""),
+                "for": row.get("for") or "",
+                "against": row.get("against") or "",
+                "last_5": row.get("last_5") or "",
+            })
+    return rows
+
+
+def _match_summary(raw: dict) -> dict:
+    venue_parts = [raw.get("ground_name") or "", raw.get("city_name") or ""]
+    scores = [s for s in (raw.get("team_a_summary"), raw.get("team_b_summary")) if s]
+    return {
+        "match_id": str(raw.get("match_id") or ""),
+        "status": raw.get("status") or "",
+        "match_type": raw.get("match_type") or "",
+        "ball_type": raw.get("ball_type") or "",
+        "overs": raw.get("overs") if raw.get("overs") is not None else "",
+        "team_a_id": str(raw.get("team_a_id") or ""),
+        "team_a": raw.get("team_a") or "",
+        "team_b_id": str(raw.get("team_b_id") or ""),
+        "team_b": raw.get("team_b") or "",
+        "team_a_summary": raw.get("team_a_summary") or "",
+        "team_b_summary": raw.get("team_b_summary") or "",
+        "scores": scores,
+        "result": raw.get("win_by") or raw.get("match_result") or "",
+        "winning_team": raw.get("winning_team") or "",
+        "round": raw.get("tournament_round_name") or "",
+        "venue": ", ".join([p for p in venue_parts if p]),
+        "start_time": raw.get("match_start_time") or "",
+        "url": f"https://cricheroes.com/scorecard/{raw.get('match_id')}/individual/match/live",
+    }
+
+
+def _page_is_before_tournament(matches: list, from_date: str) -> bool:
+    if not from_date:
+        return False
+    times = [m.get("match_start_time") or "" for m in matches if isinstance(m, dict)]
+    times = [t for t in times if t]
+    if not times:
+        return False
+    return max(times) < from_date
+
+
+def _iter_team_matches(team_id: str, tournament_id: str, from_date: str, needed: int, found: dict):
+    path = f"/team/get-team-match/{team_id}"
+    for _ in range(_TEAM_MATCH_PAGE_CAP):
+        if needed and len(found) >= needed:
+            return
+        payload = _cricheroes_api_get(path)
+        if not payload.get("status"):
+            return
+        page_matches = [m for m in _as_list(payload.get("data")) if isinstance(m, dict)]
+        for raw in page_matches:
+            if str(raw.get("tournament_id") or "") != str(tournament_id):
+                continue
+            mid = str(raw.get("match_id") or "")
+            if mid and mid not in found:
+                found[mid] = _match_summary(raw)
+        nxt = ""
+        page = payload.get("page")
+        if isinstance(page, dict):
+            nxt = page.get("next") or ""
+        if not nxt or not page_matches or _page_is_before_tournament(page_matches, from_date):
+            return
+        path = nxt if nxt.startswith("/") else "/" + nxt
+
+
+def _collect_tournament_matches(tournament_id: str, teams: list, from_date: str, match_count: int) -> dict:
+    found: dict = {}
+    team_ids = []
+    for team in teams:
+        tid = str(team.get("team_id") or "")
+        if tid and tid not in team_ids:
+            team_ids.append(tid)
+
+    def _one(team_id: str):
+        local: dict = {}
+        _iter_team_matches(team_id, tournament_id, from_date, match_count, local)
+        return local
+
+    # Walk teams together, then merge. A second pass is unnecessary: each
+    # worker filters to this tournament and we dedupe by match id.
+    if team_ids:
+        workers = min(4, len(team_ids))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, tid) for tid in team_ids]
+            for fut in as_completed(futures):
+                for mid, summary in fut.result().items():
+                    found.setdefault(mid, summary)
+                    if match_count and len(found) >= match_count:
+                        break
+    return found
+
+
+def scrape_tournament(
+    tournament_id: str,
+    *,
+    include_scorecards: bool = True,
+    scorecard_limit: int = _DEFAULT_SCORECARD_LIMIT,
+) -> dict:
+    """Scrape a whole CricHeroes tournament: profile, teams, points table, and every match."""
+    tournament_id = str(tournament_id or "").strip()
+    if not tournament_id.isdigit():
+        raise ScrapeError("tournament_id must be numeric")
+
+    try:
+        limit = int(scorecard_limit)
+    except (TypeError, ValueError):
+        limit = _DEFAULT_SCORECARD_LIMIT
+    limit = max(0, min(limit, _MAX_SCORECARD_LIMIT))
+
+    detail_payload = _cricheroes_api_get(f"/tournament/get-tournament-detail/{tournament_id}")
+    if not detail_payload.get("status") or not isinstance(detail_payload.get("data"), dict):
+        raise ScrapeError(_api_error_message(detail_payload, "CricHeroes returned no tournament for that id."))
+    detail = detail_payload["data"]
+    tournament = _tournament_summary(detail)
+    tournament["tournament_id"] = tournament["tournament_id"] or tournament_id
+
+    teams_payload = _cricheroes_api_get(f"/tournament/get-tournament-teams/{tournament_id}")
+    raw_teams = _as_list(teams_payload.get("data")) if teams_payload.get("status") else []
+    if not raw_teams:
+        raw_teams = _as_list(detail.get("teams"))
+    teams = [_team_summary(t) for t in raw_teams if isinstance(t, dict) and t.get("team_id")]
+
+    standing_payload = _cricheroes_api_get(f"/tournament/get-tournament-standing/{tournament_id}")
+    standings = _standing_rows(standing_payload) if standing_payload.get("status") else []
+
+    found = _collect_tournament_matches(
+        tournament_id,
+        teams,
+        tournament.get("from_date") or "",
+        tournament.get("match_count") or 0,
+    )
+    matches = sorted(found.values(), key=lambda m: (m.get("start_time") or "", int(m["match_id"] or 0)))
+
+    scorecards_included = 0
+    scorecard_failures = 0
+    truncated = False
+    if include_scorecards and limit > 0:
+        targets = matches[:limit]
+        truncated = len(matches) > len(targets)
+
+        def _one_card(match: dict):
+            try:
+                card = _scrape_cricheroes(match["url"])
+                return match["match_id"], card, None
+            except Exception as e:
+                return match["match_id"], None, str(e)
+
+        cards = {}
+        errors = {}
+        if targets:
+            workers = min(4, len(targets))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for mid, card, err in pool.map(_one_card, targets):
+                    if card is not None:
+                        cards[mid] = card
+                    else:
+                        errors[mid] = err
+        for match in matches:
+            if match["match_id"] in cards:
+                match["scorecard"] = cards[match["match_id"]]
+                match["ok"] = True
+                scorecards_included += 1
+            elif match["match_id"] in errors:
+                match["ok"] = False
+                match["error"] = errors[match["match_id"]]
+                scorecard_failures += 1
+
+    expected = tournament.get("match_count") or 0
+    return {
+        "source": "cricheroes",
+        "kind": "tournament",
+        "url": tournament.get("share_url") or f"https://cricheroes.com/tournament/{tournament_id}",
+        "tournament_id": tournament_id,
+        "tournament": tournament,
+        "teams": teams,
+        "standings": standings,
+        "matches": matches,
+        "total_matches": len(matches),
+        "expected_matches": expected,
+        "incomplete": bool(expected and len(matches) < expected),
+        "scorecards_included": scorecards_included,
+        "scorecard_failures": scorecard_failures,
+        "scorecards_truncated": truncated,
     }
 
 
@@ -614,6 +911,70 @@ def scorecard_to_csv(sc: dict) -> str:
                 bw.get("wides", ""), bw.get("econ", "")
             ])
         w.writerow([])
+        w.writerow([])
+
+    return buf.getvalue()
+
+
+def tournament_to_csv(tournament_scrape: dict) -> str:
+    """One CSV for a tournament: profile, teams, points table, then every match scorecard."""
+    import csv, io
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    tour = tournament_scrape.get("tournament") or {}
+
+    w.writerow(["TOURNAMENT"])
+    w.writerow(["Tournament ID", tournament_scrape.get("tournament_id", "")])
+    w.writerow(["Name", tour.get("name", "")])
+    w.writerow(["City", tour.get("city", "")])
+    w.writerow(["From", tour.get("from_date", "")])
+    w.writerow(["To", tour.get("to_date", "")])
+    w.writerow(["Ball", tour.get("ball_type", "")])
+    w.writerow(["Matches found", tournament_scrape.get("total_matches", "")])
+    w.writerow(["URL", tournament_scrape.get("url", "")])
+    w.writerow([])
+
+    w.writerow(["TEAMS"])
+    w.writerow(["Team ID", "Team", "City"])
+    for team in tournament_scrape.get("teams") or []:
+        w.writerow([team.get("team_id", ""), team.get("team_name", ""), team.get("city_name", "")])
+    w.writerow([])
+
+    w.writerow(["POINTS TABLE"])
+    w.writerow(["Group", "Round", "Team ID", "Team", "P", "W", "L", "D", "T", "NR", "Pts", "NRR", "For", "Against"])
+    for row in tournament_scrape.get("standings") or []:
+        w.writerow([
+            row.get("group", ""), row.get("round_name", ""), row.get("team_id", ""), row.get("team_name", ""),
+            row.get("matches", ""), row.get("won", ""), row.get("lost", ""), row.get("drawn", ""),
+            row.get("tied", ""), row.get("no_result", ""), row.get("points", ""), row.get("net_rr", ""),
+            row.get("for", ""), row.get("against", ""),
+        ])
+    w.writerow([])
+
+    w.writerow(["MATCHES"])
+    w.writerow(["Match ID", "Status", "Round", "Team A", "Team B", "Score A", "Score B", "Result", "Venue", "Start"])
+    for match in tournament_scrape.get("matches") or []:
+        w.writerow([
+            match.get("match_id", ""), match.get("status", ""), match.get("round", ""),
+            match.get("team_a", ""), match.get("team_b", ""),
+            match.get("team_a_summary", ""), match.get("team_b_summary", ""),
+            match.get("result", ""), match.get("venue", ""), match.get("start_time", ""),
+        ])
+    w.writerow([])
+
+    for match in tournament_scrape.get("matches") or []:
+        card = match.get("scorecard")
+        if not card:
+            if match.get("error"):
+                w.writerow([f"MATCH {match.get('match_id', '')} SCORECARD ERROR", match.get("error")])
+                w.writerow([])
+            continue
+        w.writerow([f"MATCH {match.get('match_id', '')}"])
+        # Reuse the single-scorecard serializer, dropping its trailing blanks is unnecessary.
+        text = scorecard_to_csv(card).strip("\n")
+        for line in text.splitlines():
+            buf.write(line + "\n")
         w.writerow([])
 
     return buf.getvalue()
