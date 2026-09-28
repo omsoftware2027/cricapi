@@ -20,6 +20,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 from scrapers import (  # noqa: E402
     scrape,
+    scrape_player,
     scrape_tournament,
     scorecard_to_csv,
     tournament_to_csv,
@@ -92,6 +93,7 @@ async def root():
             "any_url_csv_get": "GET /api/csv?url=...",
             "any_url_csv_post": "POST /api/csv  {url}",
             "batch": "POST /api/cricheroes/batch  {match_ids[] | urls[]}",
+            "player_json": "GET /api/cricheroes/player/{player_id}",
             "tournament_json": "GET /api/cricheroes/tournament/{tournament_id}",
             "tournament_csv": "GET /api/cricheroes/tournament/{tournament_id}/csv",
         },
@@ -190,6 +192,20 @@ def _tournament_or_400(tournament_id: str, include_scorecards: bool, scorecard_l
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.exception("tournament scrape failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.get("/cricheroes/player/{player_id}")
+async def cricheroes_player_json(player_id: str, _auth: None = Depends(require_api_token)):
+    """Photo, batting hand, bowling style, and role for a scorecard player id."""
+    if not str(player_id).isdigit():
+        raise HTTPException(status_code=400, detail="player_id must be numeric")
+    try:
+        return scrape_player(player_id)
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("player profile failed")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 

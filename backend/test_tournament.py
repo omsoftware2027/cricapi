@@ -109,6 +109,25 @@ def _route(path):
             "page": {},
             "data": [_match(119, 11), _match(112, 11, start="2016-11-01T00:00:00.000Z")],
         }
+    if path.startswith("/player/get-player-profile-info/"):
+        pid = path.rstrip("/").split("/")[-1]
+        return {"status": True, "data": {
+            "player_id": int(pid),
+            "name": "Nitin Chouhan",
+            "short_name": "",
+            "profile_photo": "https://example.test/nitin.jpg",
+            "city_name": "Pune",
+            "batting_hand": "RHB",
+            "bowling_style": "Right-arm fast",
+            "playing_role": "Top-order batter",
+            "player_skill": "",
+            "batter_category": "Hard Hitter",
+            "bowler_category": "Economist",
+            "age": "34 years",
+            "dob": "1992-01-06",
+            "played_match_count": 307,
+            "email": "hidden@example.test",
+        }}
     if path.startswith("/scorecard/get-commentary/"):
         return {"status": True, "data": {"commentary": [{
             "inning": 1, "ball": "0.1", "run": 4, "extra_run": 0, "extra_type_code": "",
@@ -181,11 +200,23 @@ def test_tournament_scorecards_attached(api):
     assert card["innings"][0]["batting"][0]["batter"] == "A"
     assert result["matches"][0]["commentary"][0]["text"] == "A to B, 4 runs"
     assert result["matches"][0]["officials"][0]["role"] == "Scorer"
+    assert result["players"][0]["player_id"] == "1"
+    assert result["players"][0]["batting_hand"] == "RHB"
+    assert result["players"][0]["profile_photo"].endswith("nitin.jpg")
+    assert "email" not in result["players"][0]
     csv_text = tournament_to_csv(result)
     assert "TOURNAMENT" in csv_text
     assert "POINTS TABLE" in csv_text
     assert "112" in csv_text
     assert "9999999999" not in csv_text
+
+
+def test_player_profile_url(api):
+    profile = scrapers.scrape_player("9869683")
+    assert profile["name"] == "Nitin Chouhan"
+    assert profile["bowling_style"] == "Right-arm fast"
+    assert profile["profile_url"] == "https://cricheroes.com/player-profile/9869683/Nitin-Chouhan"
+    assert "email" not in profile
 
 
 def test_bad_tournament_id():

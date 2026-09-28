@@ -65,7 +65,9 @@ def scrape(url: str) -> dict:
         if tournament_id:
             return scrape_tournament(tournament_id)
         # CricHeroes has its own API path; no HTML fetch needed
-        return _scrape_cricheroes(url)
+        card = _scrape_cricheroes(url)
+        card["players"] = _profiles_for_scorecard(card)
+        return card
     html = _fetch_html(url)
     if src == "cricbuzz":
         return _scrape_cricbuzz(html, url)
@@ -464,6 +466,82 @@ def _collect_tournament_matches(tournament_id: str, teams: list, from_date: str,
     return found
 
 
+def _player_ids_in_scorecard(card: dict) -> list:
+    found = []
+    seen = set()
+    for inn in card.get("innings") or []:
+        for row in (inn.get("batting") or []) + (inn.get("bowling") or []) + (inn.get("yet_to_bat") or []):
+            pid = str(row.get("player_id") or "").strip()
+            if pid.isdigit() and pid not in seen:
+                seen.add(pid)
+                found.append(pid)
+    return found
+
+
+def _profile_slug(name: str) -> str:
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", name or "") if p]
+    return "-".join(parts) or "player"
+
+
+def scrape_player(player_id: str) -> dict:
+    """Public CricHeroes profile for a scorecard player id.
+
+    The id in https://cricheroes.com/player-profile/{id}/name is the same
+    player_id already stored on batting and bowling rows.
+    """
+    player_id = str(player_id or "").strip()
+    if not player_id.isdigit():
+        raise ScrapeError("player_id must be numeric")
+    payload = _cricheroes_api_get(f"/player/get-player-profile-info/{player_id}")
+    if not payload.get("status") or not isinstance(payload.get("data"), dict):
+        raise ScrapeError(_api_error_message(payload, "CricHeroes returned no player profile for that id."))
+    d = payload["data"]
+    name = d.get("name") or ""
+    return {
+        "player_id": str(d.get("player_id") or player_id),
+        "name": name,
+        "short_name": d.get("short_name") or "",
+        "profile_photo": d.get("profile_photo") or "",
+        "profile_url": f"https://cricheroes.com/player-profile/{player_id}/{_profile_slug(name)}",
+        "city": d.get("city_name") or "",
+        "batting_hand": d.get("batting_hand") or "",
+        "bowling_style": d.get("bowling_style") or "",
+        "playing_role": d.get("playing_role") or "",
+        "player_skill": d.get("player_skill") or "",
+        "batter_category": d.get("batter_category") or "",
+        "bowler_category": d.get("bowler_category") or "",
+        "age": d.get("age") or "",
+        "date_of_birth": d.get("dob") or "",
+        "played_match_count": d.get("played_match_count") if d.get("played_match_count") is not None else "",
+    }
+
+
+def _profiles_for_ids(player_ids: list) -> list:
+    ids = []
+    seen = set()
+    for pid in player_ids:
+        pid = str(pid or "").strip()
+        if pid.isdigit() and pid not in seen:
+            seen.add(pid)
+            ids.append(pid)
+    if not ids:
+        return []
+
+    def _one(pid: str):
+        try:
+            return scrape_player(pid)
+        except ScrapeError:
+            return {"player_id": pid, "name": "", "profile_photo": "", "profile_url": f"https://cricheroes.com/player-profile/{pid}/player"}
+
+    workers = min(4, len(ids))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(_one, ids))
+
+
+def _profiles_for_scorecard(card: dict) -> list:
+    return _profiles_for_ids(_player_ids_in_scorecard(card))
+
+
 def _match_commentary(match_id: str) -> list:
     """Ball-by-ball commentary. Empty when the match has none."""
     path = f"/scorecard/get-commentary/{match_id}"
@@ -610,6 +688,13 @@ def scrape_tournament(
                 match["error"] = errors[match["match_id"]]
                 scorecard_failures += 1
 
+    player_ids = []
+    for match in matches:
+        card = match.get("scorecard")
+        if card:
+            player_ids.extend(_player_ids_in_scorecard(card))
+    players = _profiles_for_ids(player_ids)
+
     expected = tournament.get("match_count") or 0
     return {
         "source": "cricheroes",
@@ -618,6 +703,7 @@ def scrape_tournament(
         "tournament_id": tournament_id,
         "tournament": tournament,
         "teams": teams,
+        "players": players,
         "standings": standings,
         "matches": matches,
         "total_matches": len(matches),
