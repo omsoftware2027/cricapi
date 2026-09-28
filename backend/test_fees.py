@@ -190,3 +190,67 @@ def test_notify_requires_spoc_and_a_completed_match(client):
 
     bad_phone = client.put("/api/admin/teams/10/spoc", json={"spoc_name": "Asha", "phone": "123"})
     assert bad_phone.status_code == 400
+
+
+def test_upi_comes_from_settings_and_receipt_can_be_updated(client):
+    saved = client.put("/api/admin/settings/payment", json={
+        "payee_name": "30YCA",
+        "upi_id": "30yca@oksbi",
+        "gpay_number": "9988776655",
+        "payment_apps": "PhonePe / Google Pay",
+    })
+    assert saved.status_code == 200, saved.text
+    settings = saved.json()
+    assert settings["configured"] is True
+    assert settings["gpay_number"] == "9988776655"
+    assert client.get("/api/admin/settings/payment").json()["upi_id"] == "30yca@oksbi"
+
+    _spoc(client)
+    client.put("/api/admin/matches/501/fees", json={
+        "tournament_id": "2189985",
+        "match_title": "Lions vs Tigers",
+        "teams": [{"team_id": "10", "team_name": "Lions", "opponent_name": "Tigers", "amount": 6000}],
+    })
+    sent = client.post("/api/admin/matches/501/fees/notify", json={
+        "team_id": "10",
+        "match_status": "past",
+    })
+    assert sent.status_code == 200, sent.text
+    result = sent.json()["results"][0]
+    _, text = _whatsapp_text(result["whatsapp_url"])
+    assert "UPI ID: 30yca@oksbi" in text
+    assert "Number: 9988776655" in text
+    assert "Kindly submit the payment today to 30YCA via:" in text
+    upi = result["upi"]
+    assert upi["upi_uri"].startswith("upi://pay?")
+    assert "pa=30yca%40oksbi" in upi["upi_uri"]
+    assert "am=6000.00" in upi["upi_uri"]
+    assert upi["google_pay_uri"].startswith("tez://upi/pay?")
+
+    receipt = client.put("/api/admin/matches/501/fees/10/payment", json={
+        "amount_received": 6000,
+        "payment_mode": "Google Pay",
+        "reference": "UTR123456",
+        "received_on": "2026-10-18",
+        "note": "Received from SPOC",
+        "status": "paid",
+    })
+    assert receipt.status_code == 200, receipt.text
+    body = receipt.json()
+    assert body["status"] == "paid"
+    assert body["amount_received"] == "6000.00"
+    assert body["payment_mode"] == "Google Pay"
+    assert body["payment_reference"] == "UTR123456"
+
+    corrected = client.put("/api/admin/matches/501/fees/10/payment", json={
+        "amount_received": 5500,
+        "payment_mode": "PhonePe",
+        "reference": "UTR999",
+        "received_on": "2026-10-19",
+        "note": "Short by 500",
+        "status": "partial",
+    })
+    assert corrected.status_code == 200, corrected.text
+    assert corrected.json()["status"] == "partial"
+    assert corrected.json()["amount_received"] == "5500.00"
+    assert corrected.json()["payment_reference"] == "UTR999"

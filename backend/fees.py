@@ -80,14 +80,41 @@ def _connect() -> sqlite3.Connection:
                 whatsapp_error TEXT NOT NULL DEFAULT '',
                 notified_at TEXT NOT NULL DEFAULT '',
                 paid_at TEXT NOT NULL DEFAULT '',
+                amount_received TEXT NOT NULL DEFAULT '',
+                payment_mode TEXT NOT NULL DEFAULT '',
+                payment_reference TEXT NOT NULL DEFAULT '',
+                received_on TEXT NOT NULL DEFAULT '',
+                payment_note TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (match_id, team_id)
             );
+            CREATE TABLE IF NOT EXISTS payment_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payee_name TEXT NOT NULL DEFAULT '',
+                upi_id TEXT NOT NULL DEFAULT '',
+                gpay_number TEXT NOT NULL DEFAULT '',
+                payment_apps TEXT NOT NULL DEFAULT 'PhonePe / Google Pay',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
             """
         )
+        _ensure_fee_columns(conn)
         conn.commit()
         _READY.add(key)
     return conn
+
+
+def _ensure_fee_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(match_fees)")}
+    for name in (
+        "amount_received",
+        "payment_mode",
+        "payment_reference",
+        "received_on",
+        "payment_note",
+    ):
+        if name not in present:
+            conn.execute(f"ALTER TABLE match_fees ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 
 def _digits(value: str) -> str:
@@ -200,7 +227,140 @@ def _match_fee_out(row: sqlite3.Row) -> dict:
         "whatsapp_error": row["whatsapp_error"],
         "notified_at": row["notified_at"],
         "paid_at": row["paid_at"],
+        "amount_received": row["amount_received"] if "amount_received" in row.keys() else "",
+        "payment_mode": row["payment_mode"] if "payment_mode" in row.keys() else "",
+        "payment_reference": row["payment_reference"] if "payment_reference" in row.keys() else "",
+        "received_on": row["received_on"] if "received_on" in row.keys() else "",
+        "payment_note": row["payment_note"] if "payment_note" in row.keys() else "",
         "updated_at": row["updated_at"],
+    }
+
+
+def _with_upi(row: sqlite3.Row, settings: dict) -> dict:
+    fee = _match_fee_out(row)
+    note = fee.get("match_title") or f"Match {fee.get('match_id')}"
+    fee["upi"] = build_upi(settings, fee.get("amount") or "", note)
+    return fee
+
+
+def _empty_payment_settings() -> dict:
+    return {
+        "payee_name": "",
+        "upi_id": "",
+        "gpay_number": "",
+        "payment_apps": "PhonePe / Google Pay",
+        "configured": False,
+        "updated_at": "",
+    }
+
+
+def _settings_out(row: sqlite3.Row | None) -> dict:
+    if row is None:
+        return _empty_payment_settings()
+    upi_id = row["upi_id"] or ""
+    payee_name = row["payee_name"] or ""
+    return {
+        "payee_name": payee_name,
+        "upi_id": upi_id,
+        "gpay_number": row["gpay_number"] or "",
+        "payment_apps": row["payment_apps"] or "PhonePe / Google Pay",
+        "configured": bool(payee_name and upi_id),
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _read_settings(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT * FROM payment_settings WHERE id=1").fetchone()
+    return _settings_out(row)
+
+
+def _upi_id(value: str) -> str:
+    text = (value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.\-_]{1,63}@[A-Za-z][A-Za-z0-9]{1,63}", text):
+        raise FeeError("upi_id must look like name@bank")
+    return text
+
+
+def _gpay_number(value: str) -> str:
+    raw = _digits(value)
+    if not raw:
+        return ""
+    if len(raw) == 12 and raw.startswith("91"):
+        raw = raw[2:]
+    if len(raw) == 11 and raw.startswith("0"):
+        raw = raw[1:]
+    if len(raw) != 10:
+        raise FeeError("gpay_number must be a 10-digit mobile number")
+    return raw
+
+
+def get_payment_settings() -> dict:
+    with _LOCK:
+        conn = _connect()
+        try:
+            return _read_settings(conn)
+        finally:
+            conn.close()
+
+
+def save_payment_settings(payee_name: str, upi_id: str, gpay_number: str = "", payment_apps: str = "") -> dict:
+    name = _clip(payee_name, 80, "payee_name")
+    if not name:
+        raise FeeError("payee_name is required")
+    stored_upi = _upi_id(upi_id)
+    number = _gpay_number(gpay_number)
+    apps = _clip(payment_apps, 80, "payment_apps") or "PhonePe / Google Pay"
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO payment_settings (id, payee_name, upi_id, gpay_number, payment_apps, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    payee_name=excluded.payee_name,
+                    upi_id=excluded.upi_id,
+                    gpay_number=excluded.gpay_number,
+                    payment_apps=excluded.payment_apps,
+                    updated_at=excluded.updated_at
+                """,
+                (name, stored_upi, number, apps, now),
+            )
+            conn.commit()
+            return _read_settings(conn)
+        finally:
+            conn.close()
+
+
+def build_upi(settings: dict | None, amount: str, note: str = "") -> dict | None:
+    """UPI and Google Pay links for one amount, using the saved admin settings."""
+    if not settings or not settings.get("configured"):
+        return None
+    if not str(amount or "").strip():
+        return None
+    try:
+        payable = f"{Decimal(str(amount).strip()):.2f}"
+    except (InvalidOperation, AttributeError):
+        return None
+    query = urlencode(
+        {
+            "pa": settings["upi_id"],
+            "pn": settings["payee_name"],
+            "am": payable,
+            "cu": "INR",
+            "tn": (note or "Match fee")[:80],
+        },
+        quote_via=quote_plus,
+    )
+    return {
+        "payee_name": settings["payee_name"],
+        "upi_id": settings["upi_id"],
+        "gpay_number": settings.get("gpay_number") or "",
+        "payment_apps": settings.get("payment_apps") or "PhonePe / Google Pay",
+        "amount": _amount_label(payable),
+        "upi_uri": f"upi://pay?{query}",
+        "google_pay_uri": f"tez://upi/pay?{query}",
     }
 
 
@@ -478,7 +638,7 @@ def save_match_fees(
                 "SELECT * FROM match_fees WHERE match_id=? ORDER BY team_name, team_id",
                 (match_id,),
             ).fetchall()
-            saved = [_match_fee_out(row) for row in rows]
+            saved = [_with_upi(row, _read_settings(conn)) for row in rows]
         finally:
             conn.close()
     return saved
@@ -493,9 +653,10 @@ def list_match_fees(match_id: str) -> list:
                 "SELECT * FROM match_fees WHERE match_id=? ORDER BY team_name, team_id",
                 (match_id,),
             ).fetchall()
+            settings = _read_settings(conn)
         finally:
             conn.close()
-    return [_match_fee_out(row) for row in rows]
+    return [_with_upi(row, settings) for row in rows]
 
 
 def list_tournament_match_fees(tournament_id: str) -> list:
@@ -507,9 +668,10 @@ def list_tournament_match_fees(tournament_id: str) -> list:
                 "SELECT * FROM match_fees WHERE tournament_id=? ORDER BY match_date, match_id, team_name",
                 (tournament_id,),
             ).fetchall()
+            settings = _read_settings(conn)
         finally:
             conn.close()
-    return [_match_fee_out(row) for row in rows]
+    return [_with_upi(row, settings) for row in rows]
 
 
 def apply_tournament_fee(tournament_id: str, matches: list, *, include_completed: bool = False) -> dict:
@@ -593,6 +755,7 @@ def preview_fees(tournament_id: str, matches: list) -> dict:
     with _LOCK:
         conn = _connect()
         try:
+            settings = _read_settings(conn)
             for match in matches or []:
                 match_id = str(match.get("match_id") or "").strip()
                 teams = []
@@ -619,6 +782,7 @@ def preview_fees(tournament_id: str, matches: list) -> dict:
                         whatsapp_status = saved["whatsapp_status"]
                     elif config:
                         amount = config["amount"]
+                    received = _match_fee_out(saved) if saved else {}
                     teams.append({
                         "team_id": side["team_id"],
                         "team_name": side["team_name"],
@@ -630,6 +794,12 @@ def preview_fees(tournament_id: str, matches: list) -> dict:
                         "spoc": _spoc_out(spoc) if spoc else None,
                         "notified_at": notified_at,
                         "whatsapp_status": whatsapp_status,
+                        "amount_received": received.get("amount_received") or "",
+                        "payment_mode": received.get("payment_mode") or "",
+                        "payment_reference": received.get("payment_reference") or "",
+                        "received_on": received.get("received_on") or "",
+                        "payment_note": received.get("payment_note") or "",
+                        "upi": build_upi(settings, amount, str(match.get("team_a") or "") + " vs " + str(match.get("team_b") or "")),
                     })
                 annotated.append({
                     "match_id": match_id,
@@ -644,6 +814,7 @@ def preview_fees(tournament_id: str, matches: list) -> dict:
     return {
         "tournament_id": tournament_id,
         "match_fee": config,
+        "payment_settings": get_payment_settings(),
         "matches": annotated,
     }
 
@@ -658,14 +829,26 @@ def _amount_label(amount: str) -> str:
     return f"{value:.2f}"
 
 
-def render_fee_message(fee: dict, spoc: dict) -> str:
+def _pay_block(settings: dict | None, fallback: str) -> tuple[str, str]:
+    if settings and settings.get("configured"):
+        lines = [
+            settings.get("payment_apps") or "PhonePe / Google Pay",
+            f"UPI ID: {settings['upi_id']}",
+        ]
+        if settings.get("gpay_number"):
+            lines.append(f"Number: {settings['gpay_number']}")
+        return settings["payee_name"], "\n".join(lines)
+    return "30YCA", fallback or "Please use the payment details shared by 30YCA."
+
+
+def render_fee_message(fee: dict, spoc: dict, settings: dict | None = None) -> str:
     """Same shape as the console.mcapune.com renewal WhatsApp text."""
     name = (spoc.get("spoc_name") or "").strip() or "there"
     team = (fee.get("team_name") or "").strip() or "your team"
     title = (fee.get("match_title") or "").strip() or f"Match {fee.get('match_id')}"
     when = (fee.get("match_date") or "").strip()
     opponent = (fee.get("opponent_name") or "").strip()
-    details = (fee.get("payment_details") or "").strip() or "Please use the payment details shared by 30YCA."
+    payee, details = _pay_block(settings, (fee.get("payment_details") or "").strip())
     match_line = title
     if when:
         match_line = f"{match_line} on {when}"
@@ -676,7 +859,7 @@ def render_fee_message(fee: dict, spoc: dict) -> str:
         f"Hello {name}, Good Evening!\n\n"
         f"This is a reminder that {team} match fees are due.\n\n"
         f"Match: {match_line}\n\n"
-        f"Kindly submit the payment today to 30YCA via:\n"
+        f"Kindly submit the payment today to {payee} via:\n"
         f"{details}\n\n"
         f"Match Fee Amount - {amount} Rs\n\n"
         f"Thank you for your prompt attention!"
@@ -722,6 +905,7 @@ def notify_match_fee(
     with _LOCK:
         conn = _connect()
         try:
+            settings = _read_settings(conn)
             if team_id:
                 rows = conn.execute(
                     "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
@@ -779,7 +963,9 @@ def notify_match_fee(
                         f"Add a team SPOC for team {fee['team_id']} before sending WhatsApp"
                     )
                 spoc = _spoc_out(spoc_row)
-                message = render_fee_message(fee, spoc)
+                note = fee.get("match_title") or f"Match {fee.get('match_id')}"
+                upi = build_upi(settings, fee.get("amount") or "", note)
+                message = render_fee_message(fee, spoc, settings)
                 url = whatsapp_click_url(spoc["phone"], message)
                 already_paid = fee.get("status") == "paid" and not force
                 already_notified = fee.get("status") == "notified" and not force
@@ -797,6 +983,7 @@ def notify_match_fee(
                     "whatsapp_url": "" if already_paid else url,
                     "amount": fee["amount"],
                     "currency": fee.get("currency") or "INR",
+                    "upi": upi,
                     "message": "" if already_paid else message,
                 })
             conn.commit()
@@ -844,28 +1031,84 @@ def _write_notify(conn: sqlite3.Connection, fee: dict, status: str, sent: bool) 
     )
 
 
-def mark_fee_paid(match_id: str, team_id: str) -> dict:
+def update_received_payment(
+    match_id: str,
+    team_id: str,
+    *,
+    amount_received=None,
+    payment_mode: str = "",
+    reference: str = "",
+    received_on: str = "",
+    note: str = "",
+    status: str = "paid",
+) -> dict:
+    """Record or correct a payment after the money is received."""
     match_id = _require_id(match_id, "match_id")
     team_id = _require_id(team_id, "team_id")
+    status = (status or "paid").strip().lower()
+    if status not in {"paid", "partial", "pending"}:
+        raise FeeError("status must be paid, partial, or pending")
+    mode = _clip(payment_mode, 40, "payment_mode")
+    reference = _clip(reference, 80, "reference")
+    received_on = _clip(received_on, 40, "received_on")
+    note = _clip(note, 300, "note")
     now = _now()
     with _LOCK:
         conn = _connect()
         try:
-            cur = conn.execute(
-                """
-                UPDATE match_fees
-                SET status='paid', paid_at=?, updated_at=?
-                WHERE match_id=? AND team_id=?
-                """,
-                (now, now, match_id, team_id),
-            )
-            conn.commit()
-            if cur.rowcount == 0:
-                raise FeeError("No match fee exists for that team")
             row = conn.execute(
                 "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
                 (match_id, team_id),
             ).fetchone()
+            if row is None:
+                raise FeeError("No match fee exists for that team")
+            if amount_received is None or str(amount_received).strip() == "":
+                if status == "partial":
+                    raise FeeError("amount_received is required for a partial payment")
+                stored_received = row["amount"] if status == "paid" else ""
+            else:
+                stored_received = _money(amount_received)
+            if status == "paid":
+                paid_at = row["paid_at"] or now
+            elif status == "pending":
+                paid_at = ""
+            else:
+                paid_at = row["paid_at"]
+            conn.execute(
+                """
+                UPDATE match_fees SET
+                    status=?,
+                    amount_received=?,
+                    payment_mode=?,
+                    payment_reference=?,
+                    received_on=?,
+                    payment_note=?,
+                    paid_at=?,
+                    updated_at=?
+                WHERE match_id=? AND team_id=?
+                """,
+                (
+                    status,
+                    stored_received,
+                    mode,
+                    reference,
+                    received_on,
+                    note,
+                    paid_at,
+                    now,
+                    match_id,
+                    team_id,
+                ),
+            )
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
+                (match_id, team_id),
+            ).fetchone()
+            return _with_upi(saved, _read_settings(conn))
         finally:
             conn.close()
-    return _match_fee_out(row)
+
+
+def mark_fee_paid(match_id: str, team_id: str) -> dict:
+    return update_received_payment(match_id, team_id, status="paid")

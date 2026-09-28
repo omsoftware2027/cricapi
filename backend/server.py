@@ -155,6 +155,22 @@ class NotifyFeeBody(BaseModel):
     force: bool = False
 
 
+class PaymentSettingsBody(BaseModel):
+    payee_name: str
+    upi_id: str
+    gpay_number: str = ""
+    payment_apps: str = "PhonePe / Google Pay"
+
+
+class PaymentReceiptBody(BaseModel):
+    amount_received: Optional[float] = None
+    payment_mode: str = ""
+    reference: str = ""
+    received_on: str = ""
+    note: str = ""
+    status: str = "paid"
+
+
 # ---------------- Health ----------------
 
 @api_router.get("/")
@@ -182,6 +198,8 @@ async def root():
             "tournament_match_fee": "PUT /api/admin/tournaments/{tournament_id}/match-fee",
             "match_fees": "PUT /api/admin/matches/{match_id}/fees",
             "fee_notify": "POST /api/admin/matches/{match_id}/fees/notify",
+            "payment_settings": "PUT /api/admin/settings/payment",
+            "payment_receipt": "PUT /api/admin/matches/{match_id}/fees/{team_id}/payment",
         },
     }
 
@@ -576,10 +594,68 @@ async def admin_notify_match_fee(
         raise _fee_or_http(exc)
 
 
-@api_router.post("/admin/matches/{match_id}/fees/{team_id}/paid")
-async def admin_mark_fee_paid(match_id: str, team_id: str, _auth: None = Depends(require_api_token)):
+@api_router.get("/admin/settings/payment")
+async def admin_get_payment_settings(_auth: None = Depends(require_api_token)):
+    return fee_store.get_payment_settings()
+
+
+@api_router.put("/admin/settings/payment")
+async def admin_save_payment_settings(req: PaymentSettingsBody, _auth: None = Depends(require_api_token)):
+    """Google Pay number and UPI id used to build each match fee link."""
     try:
-        return fee_store.mark_fee_paid(match_id, team_id)
+        return fee_store.save_payment_settings(
+            req.payee_name,
+            req.upi_id,
+            req.gpay_number,
+            req.payment_apps,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.put("/admin/matches/{match_id}/fees/{team_id}/payment")
+async def admin_update_payment(
+    match_id: str,
+    team_id: str,
+    req: PaymentReceiptBody,
+    _auth: None = Depends(require_api_token),
+):
+    """Record a received payment, or correct it after the money has arrived."""
+    try:
+        return fee_store.update_received_payment(
+            match_id,
+            team_id,
+            amount_received=req.amount_received,
+            payment_mode=req.payment_mode,
+            reference=req.reference,
+            received_on=req.received_on,
+            note=req.note,
+            status=req.status,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.post("/admin/matches/{match_id}/fees/{team_id}/paid")
+async def admin_mark_fee_paid(
+    match_id: str,
+    team_id: str,
+    req: Optional[PaymentReceiptBody] = None,
+    _auth: None = Depends(require_api_token),
+):
+    try:
+        if req is None:
+            return fee_store.mark_fee_paid(match_id, team_id)
+        return fee_store.update_received_payment(
+            match_id,
+            team_id,
+            amount_received=req.amount_received,
+            payment_mode=req.payment_mode,
+            reference=req.reference,
+            received_on=req.received_on,
+            note=req.note,
+            status=req.status or "paid",
+        )
     except FeeError as exc:
         raise _fee_or_http(exc)
 
