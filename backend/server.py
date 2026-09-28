@@ -1,6 +1,8 @@
 """
-CricHeroes Scorecard API — pure API service.
-No database, no interactive UI. Consumers (Lovable, n8n, Zapier, etc.) call these endpoints.
+CricHeroes Scorecard API.
+Scorecard routes scrape on demand and do not store match data.
+Team SPOC contacts, per-match fees, and WhatsApp payment messages are stored
+in SQLite so Lovable can run the admin fee flow.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ from scrapers import (  # noqa: E402
     ScrapeError,
     CloudflareBlocked,
 )
+from fees import FeeError  # noqa: E402
+import fees as fee_store  # noqa: E402
 
 
 # ---------------- Auth ----------------
@@ -94,6 +98,63 @@ class OrganizerImport(BaseModel):
     limit: int = 10
 
 
+class TeamSpocBody(BaseModel):
+    spoc_name: str
+    phone: str
+    country_code: str = "91"
+    team_name: str = ""
+    tournament_id: str = ""
+
+
+class TournamentMatchFeeBody(BaseModel):
+    amount: float
+    currency: str = "INR"
+    payment_details: str = ""
+
+
+class MatchFeeTeamBody(BaseModel):
+    team_id: str
+    team_name: str = ""
+    opponent_name: str = ""
+    amount: Optional[float] = None
+
+
+class MatchFeeBody(BaseModel):
+    tournament_id: str = ""
+    match_title: str = ""
+    match_date: str = ""
+    currency: str = "INR"
+    payment_details: str = ""
+    teams: List[MatchFeeTeamBody]
+
+
+class FeeMatchRef(BaseModel):
+    match_id: str
+    status: str = ""
+    team_a_id: str = ""
+    team_a: str = ""
+    team_b_id: str = ""
+    team_b: str = ""
+    start_time: str = ""
+    match_title: str = ""
+
+
+class FeeMatchesBody(BaseModel):
+    matches: List[FeeMatchRef] = []
+    include_completed: bool = False
+
+
+class NotifyFeeBody(BaseModel):
+    team_id: str = ""
+    amount: Optional[float] = None
+    payment_details: str = ""
+    match_title: str = ""
+    match_date: str = ""
+    match_status: str = ""
+    tournament_id: str = ""
+    force: bool = False
+
+
 # ---------------- Health ----------------
 
 @api_router.get("/")
@@ -117,6 +178,10 @@ async def root():
             "organizer_import": "POST /api/cricheroes/organizer/{organizer_id}/import",
             "tournament_json": "GET /api/cricheroes/tournament/{tournament_id}",
             "tournament_csv": "GET /api/cricheroes/tournament/{tournament_id}/csv",
+            "team_spoc": "PUT /api/admin/teams/{team_id}/spoc",
+            "tournament_match_fee": "PUT /api/admin/tournaments/{tournament_id}/match-fee",
+            "match_fees": "PUT /api/admin/matches/{match_id}/fees",
+            "fee_notify": "POST /api/admin/matches/{match_id}/fees/notify",
         },
     }
 
@@ -327,6 +392,196 @@ async def cricheroes_tournament_csv(
 @api_router.post("/cricheroes/tournament")
 async def cricheroes_tournament_post(req: TournamentQuery, _auth: None = Depends(require_api_token)):
     return _tournament_or_400(req.tournament_id, req.include_scorecards, req.scorecard_limit)
+
+
+# ---------------- Admin fees and WhatsApp ----------------
+
+def _fee_or_http(exc: FeeError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@api_router.put("/admin/teams/{team_id}/spoc")
+async def admin_save_spoc(team_id: str, req: TeamSpocBody, _auth: None = Depends(require_api_token)):
+    """Save the team SPOC who receives the match-fee WhatsApp."""
+    try:
+        return fee_store.save_spoc(
+            team_id,
+            req.spoc_name,
+            req.phone,
+            country_code=req.country_code,
+            team_name=req.team_name,
+            tournament_id=req.tournament_id,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.get("/admin/teams/{team_id}/spoc")
+async def admin_get_spoc(
+    team_id: str,
+    tournament_id: str = "",
+    _auth: None = Depends(require_api_token),
+):
+    try:
+        row = fee_store.get_spoc(team_id, tournament_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Team SPOC not found")
+    return row
+
+
+@api_router.get("/admin/spocs")
+async def admin_list_spocs(tournament_id: str = "", _auth: None = Depends(require_api_token)):
+    try:
+        rows = fee_store.list_spocs(tournament_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    return {"tournament_id": tournament_id, "spocs": rows, "total": len(rows)}
+
+
+@api_router.delete("/admin/teams/{team_id}/spoc")
+async def admin_delete_spoc(
+    team_id: str,
+    tournament_id: str = "",
+    _auth: None = Depends(require_api_token),
+):
+    try:
+        deleted = fee_store.delete_spoc(team_id, tournament_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Team SPOC not found")
+    return {"deleted": True, "team_id": team_id, "tournament_id": tournament_id}
+
+
+@api_router.put("/admin/tournaments/{tournament_id}/match-fee")
+async def admin_save_tournament_fee(
+    tournament_id: str,
+    req: TournamentMatchFeeBody,
+    _auth: None = Depends(require_api_token),
+):
+    """Per-match fee each team pays. Lovable shows this on every new upcoming match."""
+    try:
+        return fee_store.save_tournament_fee(
+            tournament_id,
+            req.amount,
+            req.currency,
+            req.payment_details,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.get("/admin/tournaments/{tournament_id}/match-fee")
+async def admin_get_tournament_fee(tournament_id: str, _auth: None = Depends(require_api_token)):
+    try:
+        row = fee_store.get_tournament_fee(tournament_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Tournament match fee is not set")
+    return row
+
+
+@api_router.post("/admin/tournaments/{tournament_id}/match-fee/apply")
+async def admin_apply_tournament_fee(
+    tournament_id: str,
+    req: FeeMatchesBody,
+    _auth: None = Depends(require_api_token),
+):
+    """Attach the tournament fee to upcoming matches Lovable already loaded."""
+    try:
+        return fee_store.apply_tournament_fee(
+            tournament_id,
+            [match.model_dump() for match in req.matches],
+            include_completed=req.include_completed,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.post("/admin/tournaments/{tournament_id}/fees/preview")
+async def admin_preview_fees(
+    tournament_id: str,
+    req: FeeMatchesBody,
+    _auth: None = Depends(require_api_token),
+):
+    """Join scraped matches with the saved fee and each team's SPOC."""
+    try:
+        return fee_store.preview_fees(
+            tournament_id,
+            [match.model_dump() for match in req.matches],
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.get("/admin/tournaments/{tournament_id}/fees")
+async def admin_list_tournament_fees(tournament_id: str, _auth: None = Depends(require_api_token)):
+    try:
+        rows = fee_store.list_tournament_match_fees(tournament_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    return {"tournament_id": tournament_id, "fees": rows, "total": len(rows)}
+
+
+@api_router.put("/admin/matches/{match_id}/fees")
+async def admin_save_match_fees(match_id: str, req: MatchFeeBody, _auth: None = Depends(require_api_token)):
+    """Set the amount each team pays. Call this after the match is completed."""
+    try:
+        rows = fee_store.save_match_fees(
+            match_id,
+            [team.model_dump() for team in req.teams],
+            tournament_id=req.tournament_id,
+            match_title=req.match_title,
+            match_date=req.match_date,
+            currency=req.currency,
+            payment_details=req.payment_details,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    return {"match_id": match_id, "fees": rows}
+
+
+@api_router.get("/admin/matches/{match_id}/fees")
+async def admin_get_match_fees(match_id: str, _auth: None = Depends(require_api_token)):
+    try:
+        rows = fee_store.list_match_fees(match_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+    return {"match_id": match_id, "fees": rows}
+
+
+@api_router.post("/admin/matches/{match_id}/fees/notify")
+async def admin_notify_match_fee(
+    match_id: str,
+    req: NotifyFeeBody,
+    _auth: None = Depends(require_api_token),
+):
+    """Send the payment WhatsApp to the team SPOC. Pass team_id to message one team."""
+    try:
+        return fee_store.notify_match_fee(
+            match_id,
+            team_id=req.team_id,
+            amount=req.amount,
+            payment_details=req.payment_details,
+            match_title=req.match_title,
+            match_date=req.match_date,
+            match_status=req.match_status,
+            tournament_id=req.tournament_id,
+            force=req.force,
+        )
+    except FeeError as exc:
+        raise _fee_or_http(exc)
+
+
+@api_router.post("/admin/matches/{match_id}/fees/{team_id}/paid")
+async def admin_mark_fee_paid(match_id: str, team_id: str, _auth: None = Depends(require_api_token)):
+    try:
+        return fee_store.mark_fee_paid(match_id, team_id)
+    except FeeError as exc:
+        raise _fee_or_http(exc)
 
 
 # ---------------- Batch ----------------
