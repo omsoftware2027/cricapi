@@ -512,8 +512,138 @@ def scrape_player(player_id: str) -> dict:
         "bowler_category": d.get("bowler_category") or "",
         "age": d.get("age") or "",
         "date_of_birth": d.get("dob") or "",
-        "played_match_count": d.get("played_match_count") if d.get("played_match_count") is not None else "",
+        # Full CricHeroes career. Do not use this for 30YCA rankings.
+        "cricheroes_match_count": d.get("played_match_count") if d.get("played_match_count") is not None else "",
     }
+
+
+def _to_int(value) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _overs_to_balls(value) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if "." in text:
+        overs, balls = text.split(".", 1)
+        return _to_int(overs) * 6 + _to_int(balls[:1] or 0)
+    return _to_int(text) * 6
+
+
+def _balls_to_overs(balls: int) -> str:
+    return f"{balls // 6}.{balls % 6}"
+
+
+def _empty_stats() -> dict:
+    return {
+        "scope": "imported_tournaments",
+        "tournaments_played": 0,
+        "tournaments": [],
+        "matches": 0,
+        "innings": 0,
+        "runs": 0,
+        "balls": 0,
+        "fours": 0,
+        "sixes": 0,
+        "not_outs": 0,
+        "highest_score": 0,
+        "fifties": 0,
+        "hundreds": 0,
+        "wickets": 0,
+        "runs_conceded": 0,
+        "balls_bowled": 0,
+        "overs": "0.0",
+        "maidens": 0,
+        "strike_rate": 0,
+        "batting_average": 0,
+        "economy": 0,
+    }
+
+
+def _stats_for_player(player_id: str, appearances: list) -> dict:
+    """Career numbers from scorecards in the tournaments we imported.
+
+    A player who appears in two imported tournaments is counted in both.
+    Matches from any other CricHeroes tournament are ignored.
+    """
+    stats = _empty_stats()
+    seen_matches = set()
+    seen_tournaments = set()
+    dismissals = 0
+    for item in appearances:
+        match_id = str(item.get("match_id") or "")
+        tournament_id = str(item.get("tournament_id") or "")
+        tournament_name = item.get("tournament_name") or ""
+        if tournament_id and tournament_id not in seen_tournaments:
+            seen_tournaments.add(tournament_id)
+            stats["tournaments"].append({"tournament_id": tournament_id, "name": tournament_name})
+        if match_id and match_id not in seen_matches:
+            seen_matches.add(match_id)
+            stats["matches"] += 1
+        for bat in item.get("batting") or []:
+            if str(bat.get("player_id") or "") != player_id:
+                continue
+            runs = _to_int(bat.get("runs"))
+            stats["innings"] += 1
+            stats["runs"] += runs
+            stats["balls"] += _to_int(bat.get("balls"))
+            stats["fours"] += _to_int(bat.get("fours"))
+            stats["sixes"] += _to_int(bat.get("sixes"))
+            stats["highest_score"] = max(stats["highest_score"], runs)
+            if runs >= 100:
+                stats["hundreds"] += 1
+            elif runs >= 50:
+                stats["fifties"] += 1
+            dismissal = (bat.get("dismissal") or "").strip().lower()
+            if dismissal in ("", "not out", "notout", "retired hurt"):
+                stats["not_outs"] += 1
+            else:
+                dismissals += 1
+        for bowl in item.get("bowling") or []:
+            if str(bowl.get("player_id") or "") != player_id:
+                continue
+            stats["wickets"] += _to_int(bowl.get("wickets"))
+            stats["runs_conceded"] += _to_int(bowl.get("runs"))
+            stats["balls_bowled"] += _overs_to_balls(bowl.get("overs"))
+            stats["maidens"] += _to_int(bowl.get("maidens"))
+    stats["tournaments_played"] = len(stats["tournaments"])
+    stats["overs"] = _balls_to_overs(stats["balls_bowled"])
+    stats["strike_rate"] = round((stats["runs"] / stats["balls"]) * 100, 2) if stats["balls"] else 0
+    stats["batting_average"] = round(stats["runs"] / dismissals, 2) if dismissals else stats["runs"]
+    stats["economy"] = round(stats["runs_conceded"] / (stats["balls_bowled"] / 6), 2) if stats["balls_bowled"] else 0
+    return stats
+
+
+def _appearances_from_matches(matches: list, tournament_id: str, tournament_name: str) -> list:
+    rows = []
+    for match in matches:
+        card = match.get("scorecard") or {}
+        if not card:
+            continue
+        rows.append({
+            "match_id": match.get("match_id"),
+            "tournament_id": tournament_id,
+            "tournament_name": tournament_name,
+            "batting": [b for inn in card.get("innings") or [] for b in inn.get("batting") or []],
+            "bowling": [b for inn in card.get("innings") or [] for b in inn.get("bowling") or []],
+        })
+    return rows
+
+
+def _attach_tournament_stats(players: list, matches: list, tournament_id: str, tournament_name: str) -> None:
+    appearances = _appearances_from_matches(matches, tournament_id, tournament_name)
+    for player in players:
+        mine = [row for row in appearances if _player_in_appearance(player["player_id"], row)]
+        player["stats"] = _stats_for_player(player["player_id"], mine)
+
+
+def _player_in_appearance(player_id: str, appearance: dict) -> bool:
+    ids = [str(row.get("player_id") or "") for row in (appearance.get("batting") or []) + (appearance.get("bowling") or [])]
+    return player_id in ids
 
 
 def _profiles_for_ids(player_ids: list) -> list:
@@ -694,6 +824,7 @@ def scrape_tournament(
         if card:
             player_ids.extend(_player_ids_in_scorecard(card))
     players = _profiles_for_ids(player_ids)
+    _attach_tournament_stats(players, matches, tournament_id, tournament.get("name") or "")
 
     expected = tournament.get("match_count") or 0
     return {
@@ -712,6 +843,224 @@ def scrape_tournament(
         "scorecards_included": scorecards_included,
         "scorecard_failures": scorecard_failures,
         "scorecards_truncated": truncated,
+    }
+
+
+def scrape_tournaments(
+    tournament_ids: list,
+    *,
+    include_scorecards: bool = True,
+    scorecard_limit: int = _DEFAULT_SCORECARD_LIMIT,
+) -> dict:
+    """Import several tournaments and build career stats only from those tournaments."""
+    ids = []
+    seen = set()
+    for raw in tournament_ids or []:
+        tid = str(raw or "").strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    if not ids:
+        raise ScrapeError("Provide at least one tournament_id.")
+    if len(ids) > 40:
+        raise ScrapeError("A career import can include at most 40 tournaments at a time.")
+
+    tournaments = []
+    players_by_id = {}
+    appearances = []
+    for tid in ids:
+        scraped = scrape_tournament(
+            tid,
+            include_scorecards=include_scorecards,
+            scorecard_limit=scorecard_limit,
+        )
+        tournaments.append({
+            "tournament_id": scraped.get("tournament_id"),
+            "name": (scraped.get("tournament") or {}).get("name") or "",
+            "total_matches": scraped.get("total_matches"),
+            "scorecards_included": scraped.get("scorecards_included"),
+            "incomplete": scraped.get("incomplete"),
+        })
+        name = (scraped.get("tournament") or {}).get("name") or ""
+        appearances.extend(_appearances_from_matches(scraped.get("matches") or [], tid, name))
+        for player in scraped.get("players") or []:
+            players_by_id.setdefault(player["player_id"], player)
+
+    players = list(players_by_id.values())
+    for player in players:
+        mine = [row for row in appearances if _player_in_appearance(player["player_id"], row)]
+        player["stats"] = _stats_for_player(player["player_id"], mine)
+
+    return {
+        "source": "cricheroes",
+        "kind": "career",
+        "scope": "imported_tournaments",
+        "tournaments": tournaments,
+        "players": players,
+        "player_count": len(players),
+    }
+
+
+def tournaments_for_player(player_id: str, name_contains: str = "") -> list:
+    """List tournaments on a player's CricHeroes match history.
+
+    Use name_contains='30YCA' to keep only the tournaments that player
+    actually played for 30YCA. Individual matches are omitted.
+    """
+    player_id = str(player_id or "").strip()
+    if not player_id.isdigit():
+        raise ScrapeError("player_id must be numeric")
+    needle = (name_contains or "").strip().lower()
+    found = {}
+    path = f"/player/get-player-match/{player_id}"
+    for _ in range(40):
+        payload = _cricheroes_api_get(path)
+        if not payload.get("status"):
+            break
+        for match in _as_list(payload.get("data")):
+            if not isinstance(match, dict):
+                continue
+            tid = str(match.get("tournament_id") or "").strip()
+            name = match.get("tournament_name") or ""
+            if not tid:
+                continue
+            if needle and needle not in name.lower():
+                continue
+            row = found.setdefault(tid, {
+                "tournament_id": tid,
+                "name": name,
+                "matches_found": 0,
+            })
+            row["matches_found"] += 1
+            if name:
+                row["name"] = name
+        nxt = ""
+        page = payload.get("page")
+        if isinstance(page, dict):
+            nxt = page.get("next") or ""
+        if not nxt:
+            break
+        path = nxt if nxt.startswith("/") else "/" + nxt
+    return sorted(found.values(), key=lambda row: row["name"].lower())
+
+
+def _organizer_summary(detail: dict) -> dict:
+    cities = []
+    for city in _as_list(detail.get("cities_data")):
+        if isinstance(city, dict) and city.get("city_name"):
+            cities.append(city.get("city_name"))
+    if not cities and detail.get("cities"):
+        cities = [part.strip() for part in str(detail.get("cities")).split(",") if part.strip()]
+    organizer_id = str(detail.get("tournament_organizer_id") or "")
+    return {
+        "organizer_id": organizer_id,
+        "name": detail.get("name") or "",
+        "description": detail.get("description") or "",
+        "photo": detail.get("photo") or "",
+        "cities": cities,
+        "total_tournaments": int(detail.get("total_tournaments") or 0),
+        "rating": detail.get("rating") if detail.get("rating") is not None else "",
+        "profile_url": f"https://cricheroes.com/tournament-organiser/{organizer_id}",
+    }
+
+
+def _hosted_tournament_summary(raw: dict) -> dict:
+    return {
+        "tournament_id": str(raw.get("tournament_id") or ""),
+        "name": raw.get("name") or "",
+        "status": raw.get("status") or "",
+        "city": raw.get("city_name") or "",
+        "from_date": raw.get("from_date") or "",
+        "to_date": raw.get("to_date") or "",
+        "ball_type": raw.get("ball_type") or "",
+        "logo": raw.get("tournament_logo") or "",
+        "cover": raw.get("tournament_cover") or "",
+    }
+
+
+def list_organizer_tournaments(organizer_id: str) -> dict:
+    """Every tournament hosted by a CricHeroes organiser, such as 30 YCA (192049)."""
+    organizer_id = str(organizer_id or "").strip()
+    if not organizer_id.isdigit():
+        raise ScrapeError("organizer_id must be numeric")
+    detail_payload = _cricheroes_api_get(f"/organizer/get-tournament-organizer-detail/{organizer_id}")
+    if not detail_payload.get("status") or not isinstance(detail_payload.get("data"), dict):
+        raise ScrapeError(_api_error_message(detail_payload, "CricHeroes returned no organiser for that id."))
+    organizer = _organizer_summary(detail_payload["data"])
+
+    tournaments = []
+    seen = set()
+    path = f"/organizer/get-tournament-organizer-tournaments/{organizer_id}"
+    for _ in range(40):
+        payload = _cricheroes_api_get(path)
+        if not payload.get("status"):
+            break
+        page_rows = [row for row in _as_list(payload.get("data")) if isinstance(row, dict)]
+        for raw in page_rows:
+            tid = str(raw.get("tournament_id") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            tournaments.append(_hosted_tournament_summary(raw))
+        nxt = ""
+        page = payload.get("page")
+        if isinstance(page, dict):
+            nxt = page.get("next") or ""
+        if not nxt or not page_rows:
+            break
+        path = nxt if nxt.startswith("/") else "/" + nxt
+
+    return {
+        "source": "cricheroes",
+        "kind": "organizer",
+        "organizer": organizer,
+        "tournaments": tournaments,
+        "total_tournaments": len(tournaments),
+    }
+
+
+def scrape_organizer(
+    organizer_id: str,
+    *,
+    include_scorecards: bool = True,
+    scorecard_limit: int = _DEFAULT_SCORECARD_LIMIT,
+    offset: int = 0,
+    limit: int = 10,
+) -> dict:
+    """Scrape a slice of an organiser's tournaments.
+
+    Career stats in the result count only matches inside this slice.
+    Call again with the next offset until complete is true.
+    """
+    catalog = list_organizer_tournaments(organizer_id)
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 10))
+    chosen = catalog["tournaments"][offset:offset + limit]
+    ids = [row["tournament_id"] for row in chosen]
+    imported = scrape_tournaments(
+        ids,
+        include_scorecards=include_scorecards,
+        scorecard_limit=scorecard_limit,
+    ) if ids else {"tournaments": [], "players": [], "player_count": 0}
+    next_offset = offset + len(chosen)
+    return {
+        "source": "cricheroes",
+        "kind": "organizer_import",
+        "organizer": catalog["organizer"],
+        "total_tournaments": catalog["total_tournaments"],
+        "offset": offset,
+        "imported_tournaments": imported.get("tournaments") or [],
+        "players": imported.get("players") or [],
+        "player_count": imported.get("player_count") or 0,
+        "next_offset": next_offset,
+        "complete": next_offset >= catalog["total_tournaments"],
     }
 
 

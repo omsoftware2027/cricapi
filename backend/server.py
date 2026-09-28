@@ -22,6 +22,10 @@ from scrapers import (  # noqa: E402
     scrape,
     scrape_player,
     scrape_tournament,
+    scrape_tournaments,
+    scrape_organizer,
+    list_organizer_tournaments,
+    tournaments_for_player,
     scorecard_to_csv,
     tournament_to_csv,
     ScrapeError,
@@ -77,6 +81,19 @@ class TournamentQuery(BaseModel):
     scorecard_limit: int = 100
 
 
+class TournamentsQuery(BaseModel):
+    tournament_ids: List[str] = []
+    include_scorecards: bool = True
+    scorecard_limit: int = 100
+
+
+class OrganizerImport(BaseModel):
+    include_scorecards: bool = True
+    scorecard_limit: int = 100
+    offset: int = 0
+    limit: int = 10
+
+
 # ---------------- Health ----------------
 
 @api_router.get("/")
@@ -94,6 +111,10 @@ async def root():
             "any_url_csv_post": "POST /api/csv  {url}",
             "batch": "POST /api/cricheroes/batch  {match_ids[] | urls[]}",
             "player_json": "GET /api/cricheroes/player/{player_id}",
+            "player_tournaments": "GET /api/cricheroes/player/{player_id}/tournaments?name=30YCA",
+            "career_json": "POST /api/cricheroes/tournaments {tournament_ids[]}",
+            "organizer_json": "GET /api/cricheroes/organizer/{organizer_id}",
+            "organizer_import": "POST /api/cricheroes/organizer/{organizer_id}/import",
             "tournament_json": "GET /api/cricheroes/tournament/{tournament_id}",
             "tournament_csv": "GET /api/cricheroes/tournament/{tournament_id}/csv",
         },
@@ -192,6 +213,79 @@ def _tournament_or_400(tournament_id: str, include_scorecards: bool, scorecard_l
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.exception("tournament scrape failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.get("/cricheroes/player/{player_id}/tournaments")
+async def cricheroes_player_tournaments(
+    player_id: str,
+    name: str = "",
+    _auth: None = Depends(require_api_token),
+):
+    """Tournaments this player actually played. Pass name=30YCA to keep only those."""
+    if not str(player_id).isdigit():
+        raise HTTPException(status_code=400, detail="player_id must be numeric")
+    try:
+        rows = tournaments_for_player(player_id, name)
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("player tournaments failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+    return {"player_id": player_id, "name": name, "tournaments": rows, "total": len(rows)}
+
+
+@api_router.get("/cricheroes/organizer/{organizer_id}")
+async def cricheroes_organizer_json(organizer_id: str, _auth: None = Depends(require_api_token)):
+    """Every tournament hosted by an organiser. 30 YCA is 192049."""
+    if not str(organizer_id).isdigit():
+        raise HTTPException(status_code=400, detail="organizer_id must be numeric")
+    try:
+        return list_organizer_tournaments(organizer_id)
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("organizer list failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.post("/cricheroes/organizer/{organizer_id}/import")
+async def cricheroes_organizer_import(
+    organizer_id: str,
+    req: OrganizerImport,
+    _auth: None = Depends(require_api_token),
+):
+    """Import one slice of an organiser's tournaments. Repeat with next_offset."""
+    if not str(organizer_id).isdigit():
+        raise HTTPException(status_code=400, detail="organizer_id must be numeric")
+    try:
+        return scrape_organizer(
+            organizer_id,
+            include_scorecards=req.include_scorecards,
+            scorecard_limit=req.scorecard_limit,
+            offset=req.offset,
+            limit=req.limit,
+        )
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("organizer import failed")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@api_router.post("/cricheroes/tournaments")
+async def cricheroes_tournaments_post(req: TournamentsQuery, _auth: None = Depends(require_api_token)):
+    """Scrape several past tournaments. Career stats count only these tournaments."""
+    try:
+        return scrape_tournaments(
+            req.tournament_ids,
+            include_scorecards=req.include_scorecards,
+            scorecard_limit=req.scorecard_limit,
+        )
+    except ScrapeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("career scrape failed")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 

@@ -204,11 +204,57 @@ def test_tournament_scorecards_attached(api):
     assert result["players"][0]["batting_hand"] == "RHB"
     assert result["players"][0]["profile_photo"].endswith("nitin.jpg")
     assert "email" not in result["players"][0]
+    stats = result["players"][0]["stats"]
+    assert stats["scope"] == "imported_tournaments"
+    assert stats["matches"] == 2
+    assert stats["runs"] == 20
+    assert stats["tournaments_played"] == 1
+    assert stats["highest_score"] == 10
+    assert "cricheroes_match_count" not in stats
     csv_text = tournament_to_csv(result)
     assert "TOURNAMENT" in csv_text
     assert "POINTS TABLE" in csv_text
     assert "112" in csv_text
     assert "9999999999" not in csv_text
+
+
+def test_organizer_lists_every_page(monkeypatch):
+    pages = {
+        "/organizer/get-tournament-organizer-detail/192049": {
+            "status": True,
+            "data": {
+                "tournament_organizer_id": 192049,
+                "name": "30YCA Sports & Events Services Pvt ltd",
+                "description": "30YCA",
+                "photo": "https://example.test/30yca.jpg",
+                "cities": "Pune",
+                "cities_data": [{"city_name": "Pune"}],
+                "total_tournaments": 2,
+                "rating": 3,
+                "mobile": "9999999999",
+            },
+        },
+        "/organizer/get-tournament-organizer-tournaments/192049": {
+            "status": True,
+            "page": {"next": "/organizer/get-tournament-organizer-tournaments/192049?pageno=2"},
+            "data": [{"tournament_id": 1934612, "name": "30YCA Titans Cup", "status": "past", "city_name": "Pune", "from_date": "2024-01-01", "to_date": "2024-02-01", "ball_type": "LEATHER", "tournament_logo": "", "tournament_cover": ""}],
+        },
+        "/organizer/get-tournament-organizer-tournaments/192049?pageno=2": {
+            "status": True,
+            "page": {},
+            "data": [{"tournament_id": 1554332, "name": "30YCA Winter Cup 4.0", "status": "past", "city_name": "Pune", "from_date": "2023-01-01", "to_date": "2023-02-01", "ball_type": "LEATHER", "tournament_logo": "", "tournament_cover": ""}],
+        },
+    }
+
+    def fake_get(path):
+        return pages[path]
+
+    monkeypatch.setattr(scrapers, "_cricheroes_api_get", fake_get)
+    listed = scrapers.list_organizer_tournaments("192049")
+    assert listed["organizer"]["name"].startswith("30YCA")
+    assert listed["total_tournaments"] == 2
+    assert [row["tournament_id"] for row in listed["tournaments"]] == ["1934612", "1554332"]
+    assert "mobile" not in listed["organizer"]
 
 
 def test_player_profile_url(api):
