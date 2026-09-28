@@ -559,7 +559,7 @@ async def admin_notify_match_fee(
     req: NotifyFeeBody,
     _auth: None = Depends(require_api_token),
 ):
-    """Send the payment WhatsApp to the team SPOC. Pass team_id to message one team."""
+    """Return the api.whatsapp.com link that opens the admin's WhatsApp with the fee message."""
     try:
         return fee_store.notify_match_fee(
             match_id,

@@ -13,8 +13,7 @@ import threading
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-
-import requests
+from urllib.parse import quote_plus, urlencode
 
 ROOT_DIR = Path(__file__).parent
 _DEFAULT_DB = ROOT_DIR / "data" / "fees.sqlite"
@@ -649,100 +648,57 @@ def preview_fees(tournament_id: str, matches: list) -> dict:
     }
 
 
-def _template_param(value: str) -> str:
-    text = re.sub(r"\s+", " ", (value or "").strip())
-    if not text:
-        return "-"
-    return text[:900]
+def _amount_label(amount: str) -> str:
+    try:
+        value = Decimal(str(amount).strip())
+    except (InvalidOperation, AttributeError):
+        return str(amount or "").strip()
+    if value == value.to_integral():
+        return str(int(value))
+    return f"{value:.2f}"
 
 
 def render_fee_message(fee: dict, spoc: dict) -> str:
-    title = fee.get("match_title") or f"Match {fee.get('match_id')}"
-    when = fee.get("match_date") or "the completed match"
-    opponent = fee.get("opponent_name") or "the opposition"
-    details = (fee.get("payment_details") or "").strip() or "Use the payment details shared by 30YCA."
-    amount = fee.get("amount") or ""
-    currency = fee.get("currency") or "INR"
+    """Same shape as the console.mcapune.com renewal WhatsApp text."""
+    name = (spoc.get("spoc_name") or "").strip() or "there"
+    team = (fee.get("team_name") or "").strip() or "your team"
+    title = (fee.get("match_title") or "").strip() or f"Match {fee.get('match_id')}"
+    when = (fee.get("match_date") or "").strip()
+    opponent = (fee.get("opponent_name") or "").strip()
+    details = (fee.get("payment_details") or "").strip() or "Please use the payment details shared by 30YCA."
+    match_line = title
+    if when:
+        match_line = f"{match_line} on {when}"
+    if opponent:
+        match_line = f"{match_line} vs {opponent}"
+    amount = _amount_label(fee.get("amount") or "")
     return (
-        f"30YCA match fee\n\n"
-        f"Hello {spoc.get('spoc_name')},\n"
-        f"{fee.get('team_name') or 'Your team'} has a match fee for {title} ({when}).\n"
-        f"Opponent: {opponent}\n"
-        f"Amount to pay: {currency} {amount}\n"
-        f"Payment details:\n{details}\n\n"
-        f"Reply once the payment is done."
+        f"Hello {name}, Good Evening!\n\n"
+        f"This is a reminder that {team} match fees are due.\n\n"
+        f"Match: {match_line}\n\n"
+        f"Kindly submit the payment today to 30YCA via:\n"
+        f"{details}\n\n"
+        f"Match Fee Amount - {amount} Rs\n\n"
+        f"Thank you for your prompt attention!"
     )
 
 
-def _whatsapp_config() -> tuple[str, str, str, str]:
-    token = (os.environ.get("WHATSAPP_TOKEN") or "").strip()
-    phone_id = (os.environ.get("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
-    template = (os.environ.get("WHATSAPP_TEMPLATE_NAME") or "").strip()
-    lang = (os.environ.get("WHATSAPP_TEMPLATE_LANG") or "en").strip() or "en"
-    return token, phone_id, template, lang
+def whatsapp_click_url(phone: str, message: str) -> str:
+    """Open the admin's connected WhatsApp with the message filled in.
 
-
-def _send_whatsapp(phone: str, message: str, fee: dict, spoc: dict) -> str:
-    token, phone_id, template, lang = _whatsapp_config()
-    if not token or not phone_id:
-        raise FeeError(
-            "WhatsApp is not configured. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID on the API server.",
-            status_code=503,
-        )
-    version = (os.environ.get("WHATSAPP_API_VERSION") or "v21.0").strip() or "v21.0"
-    url = f"https://graph.facebook.com/{version}/{phone_id}/messages"
-    if template:
-        params = [
-            spoc.get("spoc_name") or "",
-            fee.get("team_name") or "Your team",
-            fee.get("match_title") or f"Match {fee.get('match_id')}",
-            fee.get("match_date") or "the completed match",
-            f"{fee.get('currency') or 'INR'} {fee.get('amount') or ''}".strip(),
-            fee.get("payment_details") or "Contact 30YCA for payment details",
-            fee.get("opponent_name") or "-",
-        ]
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "template",
-            "template": {
-                "name": template,
-                "language": {"code": lang},
-                "components": [{
-                    "type": "body",
-                    "parameters": [{"type": "text", "text": _template_param(item)} for item in params],
-                }],
-            },
-        }
-    else:
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "text",
-            "text": {"body": message[:4096]},
-        }
-    try:
-        response = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        raise FeeError(f"WhatsApp request failed: {exc}", status_code=502)
-    try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    if response.status_code >= 400:
-        err = ""
-        if isinstance(body, dict):
-            err = ((body.get("error") or {}) if isinstance(body.get("error"), dict) else {}).get("message") or ""
-        raise FeeError(err or "WhatsApp rejected the message", status_code=502)
-    messages = body.get("messages") if isinstance(body, dict) else None
-    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-        return str(messages[0].get("id") or "")
-    return ""
+    This is the same api.whatsapp.com/send link the renewal screen uses.
+    It does not call the WhatsApp Business API.
+    """
+    query = urlencode(
+        {
+            "phone": phone,
+            "text": message,
+            "type": "phone_number",
+            "app_absent": "0",
+        },
+        quote_via=quote_plus,
+    )
+    return f"https://api.whatsapp.com/send/?{query}"
 
 
 def notify_match_fee(
@@ -757,7 +713,7 @@ def notify_match_fee(
     tournament_id: str = "",
     force: bool = False,
 ) -> dict:
-    """Send the fee WhatsApp to one team, or to every team saved on the match."""
+    """Build the api.whatsapp.com link for one team, or for every team on the match."""
     _require_completed(match_status)
     match_id = _require_id(match_id, "match_id")
     team_id = _optional_id(team_id, "team_id")
@@ -812,15 +768,8 @@ def notify_match_fee(
                         "team_id": fee["team_id"],
                         "sent": False,
                         "already_paid": True,
-                        "message": "",
-                    })
-                    continue
-                if fee.get("status") == "notified" and not force:
-                    results.append({
-                        "team_id": fee["team_id"],
-                        "sent": False,
-                        "already_notified": True,
-                        "notified_at": fee.get("notified_at") or "",
+                        "delivery": "whatsapp_link",
+                        "whatsapp_url": "",
                         "message": "",
                     })
                     continue
@@ -831,83 +780,68 @@ def notify_match_fee(
                     )
                 spoc = _spoc_out(spoc_row)
                 message = render_fee_message(fee, spoc)
-                pending.append((fee, spoc, message))
-        finally:
-            conn.close()
-
-    for fee, spoc, message in pending:
-        message_id = ""
-        error = ""
-        status = "sent"
-        try:
-            message_id = _send_whatsapp(spoc["phone"], message, fee, spoc)
-        except FeeError as exc:
-            status = "failed"
-            error = str(exc)
-            _store_notify_result(fee, spoc, message, status, message_id, error, sent=False)
-            raise
-        _store_notify_result(fee, spoc, message, status, message_id, error, sent=True)
-        results.append({
-            "team_id": fee["team_id"],
-            "team_name": fee.get("team_name") or "",
-            "spoc_name": spoc["spoc_name"],
-            "phone_display": spoc["phone_display"],
-            "sent": True,
-            "already_notified": False,
-            "whatsapp_message_id": message_id,
-            "amount": fee["amount"],
-            "currency": fee.get("currency") or "INR",
-            "message": message,
-        })
-    return {"match_id": match_id, "results": results}
-
-
-def _store_notify_result(fee: dict, spoc: dict, message: str, status: str, message_id: str, error: str, sent: bool) -> None:
-    now = _now()
-    with _LOCK:
-        conn = _connect()
-        try:
-            conn.execute(
-                """
-                UPDATE match_fees SET
-                    tournament_id=?,
-                    team_name=?,
-                    opponent_name=?,
-                    match_title=?,
-                    match_date=?,
-                    amount=?,
-                    currency=?,
-                    payment_details=?,
-                    status=?,
-                    whatsapp_status=?,
-                    whatsapp_message_id=?,
-                    whatsapp_error=?,
-                    notified_at=?,
-                    updated_at=?
-                WHERE match_id=? AND team_id=?
-                """,
-                (
-                    fee.get("tournament_id") or "",
-                    fee.get("team_name") or "",
-                    fee.get("opponent_name") or "",
-                    fee.get("match_title") or "",
-                    fee.get("match_date") or "",
-                    fee.get("amount") or "",
-                    fee.get("currency") or "INR",
-                    fee.get("payment_details") or "",
-                    "notified" if sent else (fee.get("status") or "pending"),
-                    status,
-                    message_id or fee.get("whatsapp_message_id") or "",
-                    error[:500],
-                    now if sent else (fee.get("notified_at") or ""),
-                    now,
-                    fee["match_id"],
-                    fee["team_id"],
-                ),
-            )
+                url = whatsapp_click_url(spoc["phone"], message)
+                already_paid = fee.get("status") == "paid" and not force
+                already_notified = fee.get("status") == "notified" and not force
+                if not already_paid:
+                    _write_notify(conn, fee, "link_ready", sent=not already_notified)
+                results.append({
+                    "team_id": fee["team_id"],
+                    "team_name": fee.get("team_name") or "",
+                    "spoc_name": spoc["spoc_name"],
+                    "phone_display": spoc["phone_display"],
+                    "sent": not already_paid and not already_notified,
+                    "already_paid": already_paid,
+                    "already_notified": already_notified,
+                    "delivery": "whatsapp_link",
+                    "whatsapp_url": "" if already_paid else url,
+                    "amount": fee["amount"],
+                    "currency": fee.get("currency") or "INR",
+                    "message": "" if already_paid else message,
+                })
             conn.commit()
         finally:
             conn.close()
+    return {"match_id": match_id, "results": results}
+
+
+def _write_notify(conn: sqlite3.Connection, fee: dict, status: str, sent: bool) -> None:
+    now = _now()
+    conn.execute(
+        """
+        UPDATE match_fees SET
+            tournament_id=?,
+            team_name=?,
+            opponent_name=?,
+            match_title=?,
+            match_date=?,
+            amount=?,
+            currency=?,
+            payment_details=?,
+            status=?,
+            whatsapp_status=?,
+            whatsapp_error='',
+            notified_at=?,
+            updated_at=?
+        WHERE match_id=? AND team_id=?
+        """,
+        (
+            fee.get("tournament_id") or "",
+            fee.get("team_name") or "",
+            fee.get("opponent_name") or "",
+            fee.get("match_title") or "",
+            fee.get("match_date") or "",
+            fee.get("amount") or "",
+            fee.get("currency") or "INR",
+            fee.get("payment_details") or "",
+            "notified" if sent else (fee.get("status") or "pending"),
+            status,
+            now if sent else (fee.get("notified_at") or ""),
+            now,
+            fee["match_id"],
+            fee["team_id"],
+        ),
+    )
 
 
 def mark_fee_paid(match_id: str, team_id: str) -> dict:
