@@ -464,6 +464,68 @@ def _collect_tournament_matches(tournament_id: str, teams: list, from_date: str,
     return found
 
 
+def _match_commentary(match_id: str) -> list:
+    """Ball-by-ball commentary. Empty when the match has none."""
+    path = f"/scorecard/get-commentary/{match_id}"
+    rows = []
+    for _ in range(20):
+        try:
+            payload = _cricheroes_api_get(path)
+        except ScrapeError:
+            return rows
+        if not payload.get("status"):
+            return rows
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        for ball in _as_list(data.get("commentary")):
+            if not isinstance(ball, dict):
+                continue
+            rows.append({
+                "inning": ball.get("inning") or "",
+                "over": str(ball.get("ball") or ""),
+                "runs": ball.get("run") if ball.get("run") is not None else "",
+                "extra_runs": ball.get("extra_run") if ball.get("extra_run") is not None else "",
+                "extra_type": ball.get("extra_type_code") or "",
+                "is_boundary": bool(ball.get("is_boundry")),
+                "is_out": bool(ball.get("is_out")),
+                "dismissal": ball.get("out_how") or ball.get("dismiss_type") or "",
+                "dismiss_player_id": str(ball.get("dismiss_player_id") or ""),
+                "team_id": str(ball.get("team_id") or ""),
+                "text": ball.get("commentary") or "",
+            })
+        nxt = ""
+        page = payload.get("page")
+        if isinstance(page, dict):
+            nxt = page.get("next") or ""
+        if not nxt:
+            return rows
+        path = nxt if nxt.startswith("/") else "/" + nxt
+    return rows
+
+
+def _match_officials(match_id: str) -> list:
+    """Scorer, umpires, referee, and streamer assigned to the match."""
+    try:
+        payload = _cricheroes_api_get(f"/match/get-match-official/{match_id}")
+    except ScrapeError:
+        return []
+    if not payload.get("status"):
+        return []
+    officials = []
+    for row in _as_list(payload.get("data")):
+        if not isinstance(row, dict):
+            continue
+        officials.append({
+            "official_id": str(row.get("match_official_id") or ""),
+            "user_id": str(row.get("match_official_user_id") or ""),
+            "role": row.get("match_service_type_name") or "",
+            "name": row.get("name") or "",
+            "profile_photo": row.get("profile_photo") or "",
+            "city_name": row.get("city_name") or "",
+            "certified": bool(row.get("is_certified")),
+        })
+    return officials
+
+
 def scrape_tournament(
     tournament_id: str,
     *,
@@ -513,23 +575,32 @@ def scrape_tournament(
         truncated = len(matches) > len(targets)
 
         def _one_card(match: dict):
+            mid = match["match_id"]
+            card = None
+            err = None
             try:
                 card = _scrape_cricheroes(match["url"])
-                return match["match_id"], card, None
             except Exception as e:
-                return match["match_id"], None, str(e)
+                err = str(e)
+            return mid, card, err, _match_commentary(mid), _match_officials(mid)
 
         cards = {}
         errors = {}
+        extras = {}
         if targets:
             workers = min(4, len(targets))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for mid, card, err in pool.map(_one_card, targets):
+                for mid, card, err, commentary, officials in pool.map(_one_card, targets):
+                    extras[mid] = {"commentary": commentary, "officials": officials}
                     if card is not None:
                         cards[mid] = card
                     else:
                         errors[mid] = err
         for match in matches:
+            extra = extras.get(match["match_id"]) or {}
+            if extra:
+                match["commentary"] = extra.get("commentary") or []
+                match["officials"] = extra.get("officials") or []
             if match["match_id"] in cards:
                 match["scorecard"] = cards[match["match_id"]]
                 match["ok"] = True

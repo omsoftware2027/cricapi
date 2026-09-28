@@ -109,6 +109,23 @@ def _route(path):
             "page": {},
             "data": [_match(119, 11), _match(112, 11, start="2016-11-01T00:00:00.000Z")],
         }
+    if path.startswith("/scorecard/get-commentary/"):
+        return {"status": True, "data": {"commentary": [{
+            "inning": 1, "ball": "0.1", "run": 4, "extra_run": 0, "extra_type_code": "",
+            "is_boundry": 1, "is_out": 0, "out_how": "", "dismiss_type": "",
+            "dismiss_player_id": 0, "team_id": 10,
+            "commentary": "A to B, 4 runs",
+        }]}}
+    if path.startswith("/match/get-match-official/"):
+        return {"status": True, "data": [{
+            "match_official_id": 9,
+            "match_official_user_id": 8,
+            "match_service_type_name": "Scorer",
+            "name": "Official One",
+            "profile_photo": "https://example.test/o.jpg",
+            "city_name": "Ahmedabad",
+            "is_certified": 1,
+        }]}
     if path.startswith("/scorecard/get-scorecard/"):
         mid = path.rstrip("/").split("/")[-1]
         return {
@@ -160,7 +177,10 @@ def test_tournament_scorecards_attached(api):
     assert result["scorecard_failures"] == 0
     card = result["matches"][0]["scorecard"]
     assert card["source"] == "cricheroes"
+    assert card["innings"][0]["batting"][0]["player_id"] == "1"
     assert card["innings"][0]["batting"][0]["batter"] == "A"
+    assert result["matches"][0]["commentary"][0]["text"] == "A to B, 4 runs"
+    assert result["matches"][0]["officials"][0]["role"] == "Scorer"
     csv_text = tournament_to_csv(result)
     assert "TOURNAMENT" in csv_text
     assert "POINTS TABLE" in csv_text
