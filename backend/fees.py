@@ -1,8 +1,8 @@
 """Team SPOC contacts, per-match fees, and WhatsApp payment messages.
 
 Scorecard scraping stays stateless. These admin records live in SQLite so
-Lovable can save a team contact, confirm the amount after a match, and ask
-this API to send the payment WhatsApp.
+Lovable can save a team contact, confirm the amount after a match, and open
+the fee message in the admin's connected WhatsApp.
 """
 from __future__ import annotations
 
