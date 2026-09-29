@@ -1,0 +1,1114 @@
+"""Team SPOC contacts, per-match fees, and WhatsApp payment messages.
+
+Scorecard scraping stays stateless. These admin records live in SQLite so
+Lovable can save a team contact, confirm the amount after a match, and open
+the fee message in the admin's connected WhatsApp.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from urllib.parse import quote_plus, urlencode
+
+ROOT_DIR = Path(__file__).parent
+_DEFAULT_DB = ROOT_DIR / "data" / "fees.sqlite"
+_LOCK = threading.Lock()
+_READY: set[str] = set()
+
+_UPCOMING = {"upcoming", "scheduled", "fixture", "notstarted", "not started", "yet to start"}
+
+
+class FeeError(Exception):
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def db_path() -> Path:
+    raw = (os.environ.get("FEE_DB_PATH") or "").strip()
+    return Path(raw) if raw else _DEFAULT_DB
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _connect() -> sqlite3.Connection:
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    key = str(path.resolve())
+    if key not in _READY:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS team_spocs (
+                team_id TEXT NOT NULL,
+                tournament_id TEXT NOT NULL DEFAULT '',
+                team_name TEXT NOT NULL DEFAULT '',
+                spoc_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, tournament_id)
+            );
+            CREATE TABLE IF NOT EXISTS tournament_fees (
+                tournament_id TEXT PRIMARY KEY,
+                amount TEXT NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'INR',
+                payment_details TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS match_fees (
+                match_id TEXT NOT NULL,
+                team_id TEXT NOT NULL,
+                tournament_id TEXT NOT NULL DEFAULT '',
+                team_name TEXT NOT NULL DEFAULT '',
+                opponent_name TEXT NOT NULL DEFAULT '',
+                match_title TEXT NOT NULL DEFAULT '',
+                match_date TEXT NOT NULL DEFAULT '',
+                amount TEXT NOT NULL DEFAULT '',
+                currency TEXT NOT NULL DEFAULT 'INR',
+                payment_details TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                whatsapp_status TEXT NOT NULL DEFAULT '',
+                whatsapp_message_id TEXT NOT NULL DEFAULT '',
+                whatsapp_error TEXT NOT NULL DEFAULT '',
+                notified_at TEXT NOT NULL DEFAULT '',
+                paid_at TEXT NOT NULL DEFAULT '',
+                amount_received TEXT NOT NULL DEFAULT '',
+                payment_mode TEXT NOT NULL DEFAULT '',
+                payment_reference TEXT NOT NULL DEFAULT '',
+                received_on TEXT NOT NULL DEFAULT '',
+                payment_note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (match_id, team_id)
+            );
+            CREATE TABLE IF NOT EXISTS payment_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payee_name TEXT NOT NULL DEFAULT '',
+                upi_id TEXT NOT NULL DEFAULT '',
+                gpay_number TEXT NOT NULL DEFAULT '',
+                payment_apps TEXT NOT NULL DEFAULT 'PhonePe / Google Pay',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        _ensure_fee_columns(conn)
+        conn.commit()
+        _READY.add(key)
+    return conn
+
+
+def _ensure_fee_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(match_fees)")}
+    for name in (
+        "amount_received",
+        "payment_mode",
+        "payment_reference",
+        "received_on",
+        "payment_note",
+    ):
+        if name not in present:
+            conn.execute(f"ALTER TABLE match_fees ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+
+
+def _digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _require_id(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    if not text.isdigit():
+        raise FeeError(f"{label} must be numeric")
+    return text
+
+
+def _optional_id(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    if text and not text.isdigit():
+        raise FeeError(f"{label} must be numeric")
+    return text
+
+
+def normalize_phone(phone: str, country_code: str = "91") -> str:
+    """Store WhatsApp numbers as country code + subscriber digits, no plus."""
+    cc = _digits(country_code) or "91"
+    if not (1 <= len(cc) <= 3):
+        raise FeeError("country_code must be 1 to 3 digits")
+    raw = _digits(phone)
+    if not raw:
+        raise FeeError("phone is required")
+    if len(raw) == 10:
+        raw = cc + raw
+    elif len(raw) == 11 and raw.startswith("0"):
+        raw = cc + raw[1:]
+    elif raw.startswith(cc) and len(raw) > len(cc) + 7:
+        pass
+    if not (11 <= len(raw) <= 15):
+        raise FeeError("phone must be a WhatsApp number with country code")
+    return raw
+
+
+def _money(value) -> str:
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError):
+        raise FeeError("amount must be a number")
+    if amount != amount.to_integral() and amount.as_tuple().exponent < -2:
+        amount = amount.quantize(Decimal("0.01"))
+    else:
+        amount = amount.quantize(Decimal("0.01"))
+    if amount <= 0:
+        raise FeeError("amount must be greater than 0")
+    if amount > Decimal("10000000"):
+        raise FeeError("amount is too large")
+    return f"{amount:.2f}"
+
+
+def _currency(value: str) -> str:
+    text = (value or "INR").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", text):
+        raise FeeError("currency must be a 3-letter code")
+    return text
+
+
+def _clip(value: str, limit: int, label: str) -> str:
+    text = (value or "").strip()
+    if len(text) > limit:
+        raise FeeError(f"{label} must be {limit} characters or fewer")
+    return text
+
+
+def _spoc_out(row: sqlite3.Row) -> dict:
+    phone = row["phone"]
+    return {
+        "team_id": row["team_id"],
+        "tournament_id": row["tournament_id"],
+        "team_name": row["team_name"],
+        "spoc_name": row["spoc_name"],
+        "phone": phone,
+        "phone_display": f"+{phone}",
+        "updated_at": row["updated_at"],
+    }
+
+
+def _fee_config_out(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "tournament_id": row["tournament_id"],
+        "amount": row["amount"],
+        "currency": row["currency"],
+        "payment_details": row["payment_details"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _match_fee_out(row: sqlite3.Row) -> dict:
+    return {
+        "match_id": row["match_id"],
+        "team_id": row["team_id"],
+        "tournament_id": row["tournament_id"],
+        "team_name": row["team_name"],
+        "opponent_name": row["opponent_name"],
+        "match_title": row["match_title"],
+        "match_date": row["match_date"],
+        "amount": row["amount"],
+        "currency": row["currency"],
+        "payment_details": row["payment_details"],
+        "status": row["status"],
+        "whatsapp_status": row["whatsapp_status"],
+        "whatsapp_message_id": row["whatsapp_message_id"],
+        "whatsapp_error": row["whatsapp_error"],
+        "notified_at": row["notified_at"],
+        "paid_at": row["paid_at"],
+        "amount_received": row["amount_received"] if "amount_received" in row.keys() else "",
+        "payment_mode": row["payment_mode"] if "payment_mode" in row.keys() else "",
+        "payment_reference": row["payment_reference"] if "payment_reference" in row.keys() else "",
+        "received_on": row["received_on"] if "received_on" in row.keys() else "",
+        "payment_note": row["payment_note"] if "payment_note" in row.keys() else "",
+        "updated_at": row["updated_at"],
+    }
+
+
+def _with_upi(row: sqlite3.Row, settings: dict) -> dict:
+    fee = _match_fee_out(row)
+    note = fee.get("match_title") or f"Match {fee.get('match_id')}"
+    fee["upi"] = build_upi(settings, fee.get("amount") or "", note)
+    return fee
+
+
+def _empty_payment_settings() -> dict:
+    return {
+        "payee_name": "",
+        "upi_id": "",
+        "gpay_number": "",
+        "payment_apps": "PhonePe / Google Pay",
+        "configured": False,
+        "updated_at": "",
+    }
+
+
+def _settings_out(row: sqlite3.Row | None) -> dict:
+    if row is None:
+        return _empty_payment_settings()
+    upi_id = row["upi_id"] or ""
+    payee_name = row["payee_name"] or ""
+    return {
+        "payee_name": payee_name,
+        "upi_id": upi_id,
+        "gpay_number": row["gpay_number"] or "",
+        "payment_apps": row["payment_apps"] or "PhonePe / Google Pay",
+        "configured": bool(payee_name and upi_id),
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _read_settings(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT * FROM payment_settings WHERE id=1").fetchone()
+    return _settings_out(row)
+
+
+def _upi_id(value: str) -> str:
+    text = (value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.\-_]{1,63}@[A-Za-z][A-Za-z0-9]{1,63}", text):
+        raise FeeError("upi_id must look like name@bank")
+    return text
+
+
+def _gpay_number(value: str) -> str:
+    raw = _digits(value)
+    if not raw:
+        return ""
+    if len(raw) == 12 and raw.startswith("91"):
+        raw = raw[2:]
+    if len(raw) == 11 and raw.startswith("0"):
+        raw = raw[1:]
+    if len(raw) != 10:
+        raise FeeError("gpay_number must be a 10-digit mobile number")
+    return raw
+
+
+def get_payment_settings() -> dict:
+    with _LOCK:
+        conn = _connect()
+        try:
+            return _read_settings(conn)
+        finally:
+            conn.close()
+
+
+def save_payment_settings(payee_name: str, upi_id: str, gpay_number: str = "", payment_apps: str = "") -> dict:
+    name = _clip(payee_name, 80, "payee_name")
+    if not name:
+        raise FeeError("payee_name is required")
+    stored_upi = _upi_id(upi_id)
+    number = _gpay_number(gpay_number)
+    apps = _clip(payment_apps, 80, "payment_apps") or "PhonePe / Google Pay"
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO payment_settings (id, payee_name, upi_id, gpay_number, payment_apps, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    payee_name=excluded.payee_name,
+                    upi_id=excluded.upi_id,
+                    gpay_number=excluded.gpay_number,
+                    payment_apps=excluded.payment_apps,
+                    updated_at=excluded.updated_at
+                """,
+                (name, stored_upi, number, apps, now),
+            )
+            conn.commit()
+            return _read_settings(conn)
+        finally:
+            conn.close()
+
+
+def build_upi(settings: dict | None, amount: str, note: str = "") -> dict | None:
+    """UPI and Google Pay links for one amount, using the saved admin settings."""
+    if not settings or not settings.get("configured"):
+        return None
+    if not str(amount or "").strip():
+        return None
+    try:
+        payable = f"{Decimal(str(amount).strip()):.2f}"
+    except (InvalidOperation, AttributeError):
+        return None
+    query = urlencode(
+        {
+            "pa": settings["upi_id"],
+            "pn": settings["payee_name"],
+            "am": payable,
+            "cu": "INR",
+            "tn": (note or "Match fee")[:80],
+        },
+        quote_via=quote_plus,
+    )
+    return {
+        "payee_name": settings["payee_name"],
+        "upi_id": settings["upi_id"],
+        "gpay_number": settings.get("gpay_number") or "",
+        "payment_apps": settings.get("payment_apps") or "PhonePe / Google Pay",
+        "amount": _amount_label(payable),
+        "upi_uri": f"upi://pay?{query}",
+        "google_pay_uri": f"tez://upi/pay?{query}",
+    }
+
+
+def save_spoc(
+    team_id: str,
+    spoc_name: str,
+    phone: str,
+    *,
+    country_code: str = "91",
+    team_name: str = "",
+    tournament_id: str = "",
+) -> dict:
+    team_id = _require_id(team_id, "team_id")
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    name = _clip(spoc_name, 80, "spoc_name")
+    if not name:
+        raise FeeError("spoc_name is required")
+    stored_phone = normalize_phone(phone, country_code)
+    team_name = _clip(team_name, 120, "team_name")
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO team_spocs (team_id, tournament_id, team_name, spoc_name, phone, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(team_id, tournament_id) DO UPDATE SET
+                    team_name=excluded.team_name,
+                    spoc_name=excluded.spoc_name,
+                    phone=excluded.phone,
+                    updated_at=excluded.updated_at
+                """,
+                (team_id, tournament_id, team_name, name, stored_phone, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=?",
+                (team_id, tournament_id),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _spoc_out(row)
+
+
+def get_spoc(team_id: str, tournament_id: str = "") -> dict | None:
+    team_id = _require_id(team_id, "team_id")
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = _resolve_spoc(conn, team_id, tournament_id)
+        finally:
+            conn.close()
+    return _spoc_out(row) if row else None
+
+
+def _resolve_spoc(conn: sqlite3.Connection, team_id: str, tournament_id: str) -> sqlite3.Row | None:
+    if tournament_id:
+        row = conn.execute(
+            "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=?",
+            (team_id, tournament_id),
+        ).fetchone()
+        if row:
+            return row
+    return conn.execute(
+        "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=''",
+        (team_id,),
+    ).fetchone()
+
+
+def list_spocs(tournament_id: str = "") -> list:
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            if tournament_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM team_spocs
+                    WHERE tournament_id=? OR tournament_id=''
+                    ORDER BY team_name, team_id, tournament_id DESC
+                    """,
+                    (tournament_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM team_spocs ORDER BY team_name, team_id"
+                ).fetchall()
+        finally:
+            conn.close()
+    return [_spoc_out(row) for row in rows]
+
+
+def delete_spoc(team_id: str, tournament_id: str = "") -> bool:
+    team_id = _require_id(team_id, "team_id")
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM team_spocs WHERE team_id=? AND tournament_id=?",
+                (team_id, tournament_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def save_tournament_fee(tournament_id: str, amount, currency: str = "INR", payment_details: str = "") -> dict:
+    tournament_id = _require_id(tournament_id, "tournament_id")
+    stored_amount = _money(amount)
+    stored_currency = _currency(currency)
+    details = _clip(payment_details, 1000, "payment_details")
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO tournament_fees (tournament_id, amount, currency, payment_details, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(tournament_id) DO UPDATE SET
+                    amount=excluded.amount,
+                    currency=excluded.currency,
+                    payment_details=excluded.payment_details,
+                    updated_at=excluded.updated_at
+                """,
+                (tournament_id, stored_amount, stored_currency, details, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM tournament_fees WHERE tournament_id=?",
+                (tournament_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _fee_config_out(row)
+
+
+def get_tournament_fee(tournament_id: str) -> dict | None:
+    tournament_id = _require_id(tournament_id, "tournament_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM tournament_fees WHERE tournament_id=?",
+                (tournament_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _fee_config_out(row)
+
+
+def _status_text(status: str) -> str:
+    return re.sub(r"[\s_-]+", " ", (status or "").strip().lower())
+
+
+def _is_upcoming(status: str) -> bool:
+    text = _status_text(status)
+    return text in _UPCOMING or "upcoming" in text
+
+
+def _require_completed(status: str) -> None:
+    text = _status_text(status)
+    if not text:
+        raise FeeError("Pass match_status. The fee WhatsApp is sent after the match is completed.")
+    if text in _UPCOMING or "upcoming" in text or text == "live" or text.startswith("live "):
+        raise FeeError("The fee WhatsApp is sent after the match is completed.")
+
+
+def _team_sides(match: dict) -> list:
+    sides = []
+    pairs = (
+        ("team_a_id", "team_a", "team_b"),
+        ("team_b_id", "team_b", "team_a"),
+    )
+    for id_key, name_key, opp_key in pairs:
+        team_id = str(match.get(id_key) or "").strip()
+        if not team_id.isdigit():
+            continue
+        sides.append({
+            "team_id": team_id,
+            "team_name": str(match.get(name_key) or "").strip(),
+            "opponent_name": str(match.get(opp_key) or "").strip(),
+        })
+    return sides
+
+
+def save_match_fees(
+    match_id: str,
+    teams: list,
+    *,
+    tournament_id: str = "",
+    match_title: str = "",
+    match_date: str = "",
+    currency: str = "INR",
+    payment_details: str = "",
+) -> list:
+    match_id = _require_id(match_id, "match_id")
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    match_title = _clip(match_title, 180, "match_title")
+    match_date = _clip(match_date, 40, "match_date")
+    stored_currency = _currency(currency)
+    details = _clip(payment_details, 1000, "payment_details")
+    if not teams:
+        raise FeeError("teams is required")
+    now = _now()
+    saved = []
+    with _LOCK:
+        conn = _connect()
+        try:
+            config = None
+            if tournament_id:
+                config = conn.execute(
+                    "SELECT * FROM tournament_fees WHERE tournament_id=?",
+                    (tournament_id,),
+                ).fetchone()
+            for team in teams:
+                team_id = _require_id(str(team.get("team_id") or ""), "team_id")
+                team_name = _clip(str(team.get("team_name") or ""), 120, "team_name")
+                opponent = _clip(str(team.get("opponent_name") or ""), 120, "opponent_name")
+                raw_amount = team.get("amount")
+                if raw_amount is None or str(raw_amount).strip() == "":
+                    if config is None:
+                        raise FeeError("Set the tournament match fee or pass an amount for each team")
+                    stored_amount = config["amount"]
+                    row_currency = config["currency"]
+                    row_details = details or config["payment_details"]
+                else:
+                    stored_amount = _money(raw_amount)
+                    row_currency = stored_currency
+                    row_details = details or (config["payment_details"] if config else "")
+                existing = conn.execute(
+                    "SELECT status, notified_at, paid_at, whatsapp_status, whatsapp_message_id FROM match_fees WHERE match_id=? AND team_id=?",
+                    (match_id, team_id),
+                ).fetchone()
+                status = existing["status"] if existing else "pending"
+                if status == "paid":
+                    status = "paid"
+                conn.execute(
+                    """
+                    INSERT INTO match_fees (
+                        match_id, team_id, tournament_id, team_name, opponent_name,
+                        match_title, match_date, amount, currency, payment_details,
+                        status, whatsapp_status, whatsapp_message_id, whatsapp_error,
+                        notified_at, paid_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+                    ON CONFLICT(match_id, team_id) DO UPDATE SET
+                        tournament_id=excluded.tournament_id,
+                        team_name=excluded.team_name,
+                        opponent_name=excluded.opponent_name,
+                        match_title=excluded.match_title,
+                        match_date=excluded.match_date,
+                        amount=excluded.amount,
+                        currency=excluded.currency,
+                        payment_details=excluded.payment_details,
+                        status=excluded.status,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        match_id, team_id, tournament_id, team_name, opponent,
+                        match_title, match_date, stored_amount, row_currency, row_details,
+                        status,
+                        existing["whatsapp_status"] if existing else "",
+                        existing["whatsapp_message_id"] if existing else "",
+                        existing["notified_at"] if existing else "",
+                        existing["paid_at"] if existing else "",
+                        now,
+                    ),
+                )
+            conn.commit()
+            rows = conn.execute(
+                "SELECT * FROM match_fees WHERE match_id=? ORDER BY team_name, team_id",
+                (match_id,),
+            ).fetchall()
+            saved = [_with_upi(row, _read_settings(conn)) for row in rows]
+        finally:
+            conn.close()
+    return saved
+
+
+def list_match_fees(match_id: str) -> list:
+    match_id = _require_id(match_id, "match_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM match_fees WHERE match_id=? ORDER BY team_name, team_id",
+                (match_id,),
+            ).fetchall()
+            settings = _read_settings(conn)
+        finally:
+            conn.close()
+    return [_with_upi(row, settings) for row in rows]
+
+
+def list_tournament_match_fees(tournament_id: str) -> list:
+    tournament_id = _require_id(tournament_id, "tournament_id")
+    with _LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM match_fees WHERE tournament_id=? ORDER BY match_date, match_id, team_name",
+                (tournament_id,),
+            ).fetchall()
+            settings = _read_settings(conn)
+        finally:
+            conn.close()
+    return [_with_upi(row, settings) for row in rows]
+
+
+def apply_tournament_fee(tournament_id: str, matches: list, *, include_completed: bool = False) -> dict:
+    """Copy the tournament per-match fee onto matches that do not have an amount yet."""
+    tournament_id = _require_id(tournament_id, "tournament_id")
+    created = 0
+    skipped = 0
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            config = conn.execute(
+                "SELECT * FROM tournament_fees WHERE tournament_id=?",
+                (tournament_id,),
+            ).fetchone()
+            if config is None:
+                raise FeeError("Set the tournament per-match fee before attaching it to matches")
+            for match in matches or []:
+                match_id = str(match.get("match_id") or "").strip()
+                if not match_id.isdigit():
+                    skipped += 1
+                    continue
+                if not include_completed and not _is_upcoming(str(match.get("status") or "")):
+                    skipped += 1
+                    continue
+                title = _clip(str(match.get("match_title") or ""), 180, "match_title")
+                if not title:
+                    names = [str(match.get("team_a") or "").strip(), str(match.get("team_b") or "").strip()]
+                    title = " vs ".join([n for n in names if n])[:180]
+                match_date = _clip(str(match.get("start_time") or match.get("match_date") or ""), 40, "match_date")
+                for side in _team_sides(match):
+                    existing = conn.execute(
+                        "SELECT amount FROM match_fees WHERE match_id=? AND team_id=?",
+                        (match_id, side["team_id"]),
+                    ).fetchone()
+                    if existing and existing["amount"]:
+                        skipped += 1
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO match_fees (
+                            match_id, team_id, tournament_id, team_name, opponent_name,
+                            match_title, match_date, amount, currency, payment_details,
+                            status, whatsapp_status, whatsapp_message_id, whatsapp_error,
+                            notified_at, paid_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', '', '', ?)
+                        ON CONFLICT(match_id, team_id) DO UPDATE SET
+                            tournament_id=excluded.tournament_id,
+                            team_name=excluded.team_name,
+                            opponent_name=excluded.opponent_name,
+                            match_title=excluded.match_title,
+                            match_date=excluded.match_date,
+                            amount=excluded.amount,
+                            currency=excluded.currency,
+                            payment_details=excluded.payment_details,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            match_id, side["team_id"], tournament_id, side["team_name"], side["opponent_name"],
+                            title, match_date, config["amount"], config["currency"], config["payment_details"],
+                            now,
+                        ),
+                    )
+                    created += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return {
+        "tournament_id": tournament_id,
+        "attached": created,
+        "skipped": skipped,
+        "match_fee": get_tournament_fee(tournament_id),
+    }
+
+
+def preview_fees(tournament_id: str, matches: list) -> dict:
+    """Annotate matches Lovable already scraped with the fee and the team SPOC."""
+    tournament_id = _require_id(tournament_id, "tournament_id")
+    config = get_tournament_fee(tournament_id)
+    annotated = []
+    with _LOCK:
+        conn = _connect()
+        try:
+            settings = _read_settings(conn)
+            for match in matches or []:
+                match_id = str(match.get("match_id") or "").strip()
+                teams = []
+                for side in _team_sides(match):
+                    saved = None
+                    if match_id.isdigit():
+                        saved = conn.execute(
+                            "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
+                            (match_id, side["team_id"]),
+                        ).fetchone()
+                    spoc = _resolve_spoc(conn, side["team_id"], tournament_id)
+                    amount = ""
+                    currency = (config or {}).get("currency") or "INR"
+                    details = (config or {}).get("payment_details") or ""
+                    status = "included" if config else "unset"
+                    notified_at = ""
+                    whatsapp_status = ""
+                    if saved:
+                        amount = saved["amount"]
+                        currency = saved["currency"]
+                        details = saved["payment_details"]
+                        status = saved["status"]
+                        notified_at = saved["notified_at"]
+                        whatsapp_status = saved["whatsapp_status"]
+                    elif config:
+                        amount = config["amount"]
+                    received = _match_fee_out(saved) if saved else {}
+                    teams.append({
+                        "team_id": side["team_id"],
+                        "team_name": side["team_name"],
+                        "opponent_name": side["opponent_name"],
+                        "amount": amount,
+                        "currency": currency,
+                        "payment_details": details,
+                        "status": status,
+                        "spoc": _spoc_out(spoc) if spoc else None,
+                        "notified_at": notified_at,
+                        "whatsapp_status": whatsapp_status,
+                        "amount_received": received.get("amount_received") or "",
+                        "payment_mode": received.get("payment_mode") or "",
+                        "payment_reference": received.get("payment_reference") or "",
+                        "received_on": received.get("received_on") or "",
+                        "payment_note": received.get("payment_note") or "",
+                        "upi": build_upi(settings, amount, str(match.get("team_a") or "") + " vs " + str(match.get("team_b") or "")),
+                    })
+                annotated.append({
+                    "match_id": match_id,
+                    "status": match.get("status") or "",
+                    "start_time": match.get("start_time") or "",
+                    "team_a": match.get("team_a") or "",
+                    "team_b": match.get("team_b") or "",
+                    "teams": teams,
+                })
+        finally:
+            conn.close()
+    return {
+        "tournament_id": tournament_id,
+        "match_fee": config,
+        "payment_settings": get_payment_settings(),
+        "matches": annotated,
+    }
+
+
+def _amount_label(amount: str) -> str:
+    try:
+        value = Decimal(str(amount).strip())
+    except (InvalidOperation, AttributeError):
+        return str(amount or "").strip()
+    if value == value.to_integral():
+        return str(int(value))
+    return f"{value:.2f}"
+
+
+def _pay_block(settings: dict | None, fallback: str) -> tuple[str, str]:
+    if settings and settings.get("configured"):
+        lines = [
+            settings.get("payment_apps") or "PhonePe / Google Pay",
+            f"UPI ID: {settings['upi_id']}",
+        ]
+        if settings.get("gpay_number"):
+            lines.append(f"Number: {settings['gpay_number']}")
+        return settings["payee_name"], "\n".join(lines)
+    return "30YCA", fallback or "Please use the payment details shared by 30YCA."
+
+
+def render_fee_message(fee: dict, spoc: dict, settings: dict | None = None) -> str:
+    """Same shape as the console.mcapune.com renewal WhatsApp text."""
+    name = (spoc.get("spoc_name") or "").strip() or "there"
+    team = (fee.get("team_name") or "").strip() or "your team"
+    title = (fee.get("match_title") or "").strip() or f"Match {fee.get('match_id')}"
+    when = (fee.get("match_date") or "").strip()
+    opponent = (fee.get("opponent_name") or "").strip()
+    payee, details = _pay_block(settings, (fee.get("payment_details") or "").strip())
+    match_line = title
+    if when:
+        match_line = f"{match_line} on {when}"
+    if opponent:
+        match_line = f"{match_line} vs {opponent}"
+    amount = _amount_label(fee.get("amount") or "")
+    return (
+        f"Hello {name}, Good Evening!\n\n"
+        f"This is a reminder that {team} match fees are due.\n\n"
+        f"Match: {match_line}\n\n"
+        f"Kindly submit the payment today to {payee} via:\n"
+        f"{details}\n\n"
+        f"Match Fee Amount - {amount} Rs\n\n"
+        f"Thank you for your prompt attention!"
+    )
+
+
+def whatsapp_click_url(phone: str, message: str) -> str:
+    """Open the admin's connected WhatsApp with the message filled in.
+
+    This is the same api.whatsapp.com/send link the renewal screen uses.
+    It does not call the WhatsApp Business API.
+    """
+    query = urlencode(
+        {
+            "phone": phone,
+            "text": message,
+            "type": "phone_number",
+            "app_absent": "0",
+        },
+        quote_via=quote_plus,
+    )
+    return f"https://api.whatsapp.com/send/?{query}"
+
+
+def notify_match_fee(
+    match_id: str,
+    *,
+    team_id: str = "",
+    amount=None,
+    payment_details: str = "",
+    match_title: str = "",
+    match_date: str = "",
+    match_status: str = "",
+    tournament_id: str = "",
+    force: bool = False,
+) -> dict:
+    """Build the api.whatsapp.com link for one team, or for every team on the match."""
+    _require_completed(match_status)
+    match_id = _require_id(match_id, "match_id")
+    team_id = _optional_id(team_id, "team_id")
+    tournament_id = _optional_id(tournament_id, "tournament_id")
+    results = []
+    with _LOCK:
+        conn = _connect()
+        try:
+            settings = _read_settings(conn)
+            if team_id:
+                rows = conn.execute(
+                    "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
+                    (match_id, team_id),
+                ).fetchall()
+                if not rows:
+                    raise FeeError("Save the match fee for this team before sending WhatsApp")
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM match_fees WHERE match_id=? ORDER BY team_name, team_id",
+                    (match_id,),
+                ).fetchall()
+                if not rows:
+                    raise FeeError("Save the match fee before sending WhatsApp")
+            pending = []
+            for row in rows:
+                fee = dict(row)
+                if tournament_id:
+                    fee["tournament_id"] = tournament_id
+                if match_title:
+                    fee["match_title"] = _clip(match_title, 180, "match_title")
+                if match_date:
+                    fee["match_date"] = _clip(match_date, 40, "match_date")
+                if payment_details:
+                    fee["payment_details"] = _clip(payment_details, 1000, "payment_details")
+                if amount is not None and str(amount).strip() != "":
+                    fee["amount"] = _money(amount)
+                elif not fee.get("amount"):
+                    config = None
+                    if fee.get("tournament_id"):
+                        config = conn.execute(
+                            "SELECT * FROM tournament_fees WHERE tournament_id=?",
+                            (fee["tournament_id"],),
+                        ).fetchone()
+                    if config:
+                        fee["amount"] = config["amount"]
+                        fee["currency"] = fee["currency"] or config["currency"]
+                        if not fee.get("payment_details"):
+                            fee["payment_details"] = config["payment_details"]
+                if not fee.get("amount"):
+                    raise FeeError("Add the amount before sending the WhatsApp fee message")
+                if fee.get("status") == "paid" and not force:
+                    results.append({
+                        "team_id": fee["team_id"],
+                        "sent": False,
+                        "already_paid": True,
+                        "delivery": "whatsapp_link",
+                        "whatsapp_url": "",
+                        "message": "",
+                    })
+                    continue
+                spoc_row = _resolve_spoc(conn, fee["team_id"], fee.get("tournament_id") or "")
+                if spoc_row is None:
+                    raise FeeError(
+                        f"Add a team SPOC for team {fee['team_id']} before sending WhatsApp"
+                    )
+                spoc = _spoc_out(spoc_row)
+                note = fee.get("match_title") or f"Match {fee.get('match_id')}"
+                upi = build_upi(settings, fee.get("amount") or "", note)
+                message = render_fee_message(fee, spoc, settings)
+                url = whatsapp_click_url(spoc["phone"], message)
+                already_paid = fee.get("status") == "paid" and not force
+                already_notified = fee.get("status") == "notified" and not force
+                if not already_paid:
+                    _write_notify(conn, fee, "link_ready", sent=not already_notified)
+                results.append({
+                    "team_id": fee["team_id"],
+                    "team_name": fee.get("team_name") or "",
+                    "spoc_name": spoc["spoc_name"],
+                    "phone_display": spoc["phone_display"],
+                    "sent": not already_paid and not already_notified,
+                    "already_paid": already_paid,
+                    "already_notified": already_notified,
+                    "delivery": "whatsapp_link",
+                    "whatsapp_url": "" if already_paid else url,
+                    "amount": fee["amount"],
+                    "currency": fee.get("currency") or "INR",
+                    "upi": upi,
+                    "message": "" if already_paid else message,
+                })
+            conn.commit()
+        finally:
+            conn.close()
+    return {"match_id": match_id, "results": results}
+
+
+def _write_notify(conn: sqlite3.Connection, fee: dict, status: str, sent: bool) -> None:
+    now = _now()
+    conn.execute(
+        """
+        UPDATE match_fees SET
+            tournament_id=?,
+            team_name=?,
+            opponent_name=?,
+            match_title=?,
+            match_date=?,
+            amount=?,
+            currency=?,
+            payment_details=?,
+            status=?,
+            whatsapp_status=?,
+            whatsapp_error='',
+            notified_at=?,
+            updated_at=?
+        WHERE match_id=? AND team_id=?
+        """,
+        (
+            fee.get("tournament_id") or "",
+            fee.get("team_name") or "",
+            fee.get("opponent_name") or "",
+            fee.get("match_title") or "",
+            fee.get("match_date") or "",
+            fee.get("amount") or "",
+            fee.get("currency") or "INR",
+            fee.get("payment_details") or "",
+            "notified" if sent else (fee.get("status") or "pending"),
+            status,
+            now if sent else (fee.get("notified_at") or ""),
+            now,
+            fee["match_id"],
+            fee["team_id"],
+        ),
+    )
+
+
+def update_received_payment(
+    match_id: str,
+    team_id: str,
+    *,
+    amount_received=None,
+    payment_mode: str = "",
+    reference: str = "",
+    received_on: str = "",
+    note: str = "",
+    status: str = "paid",
+) -> dict:
+    """Record or correct a payment after the money is received."""
+    match_id = _require_id(match_id, "match_id")
+    team_id = _require_id(team_id, "team_id")
+    status = (status or "paid").strip().lower()
+    if status not in {"paid", "partial", "pending"}:
+        raise FeeError("status must be paid, partial, or pending")
+    mode = _clip(payment_mode, 40, "payment_mode")
+    reference = _clip(reference, 80, "reference")
+    received_on = _clip(received_on, 40, "received_on")
+    note = _clip(note, 300, "note")
+    now = _now()
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
+                (match_id, team_id),
+            ).fetchone()
+            if row is None:
+                raise FeeError("No match fee exists for that team")
+            if amount_received is None or str(amount_received).strip() == "":
+                if status == "partial":
+                    raise FeeError("amount_received is required for a partial payment")
+                stored_received = row["amount"] if status == "paid" else ""
+            else:
+                stored_received = _money(amount_received)
+            if status == "paid":
+                paid_at = row["paid_at"] or now
+            elif status == "pending":
+                paid_at = ""
+            else:
+                paid_at = row["paid_at"]
+            conn.execute(
+                """
+                UPDATE match_fees SET
+                    status=?,
+                    amount_received=?,
+                    payment_mode=?,
+                    payment_reference=?,
+                    received_on=?,
+                    payment_note=?,
+                    paid_at=?,
+                    updated_at=?
+                WHERE match_id=? AND team_id=?
+                """,
+                (
+                    status,
+                    stored_received,
+                    mode,
+                    reference,
+                    received_on,
+                    note,
+                    paid_at,
+                    now,
+                    match_id,
+                    team_id,
+                ),
+            )
+            conn.commit()
+            saved = conn.execute(
+                "SELECT * FROM match_fees WHERE match_id=? AND team_id=?",
+                (match_id, team_id),
+            ).fetchone()
+            return _with_upi(saved, _read_settings(conn))
+        finally:
+            conn.close()
+
+
+def mark_fee_paid(match_id: str, team_id: str) -> dict:
+    return update_received_payment(match_id, team_id, status="paid")
