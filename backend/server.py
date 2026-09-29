@@ -35,6 +35,8 @@ from scrapers import (  # noqa: E402
 )
 from fees import FeeError  # noqa: E402
 import fees as fee_store  # noqa: E402
+from rankings import RankError  # noqa: E402
+import rankings as ranking_store  # noqa: E402
 
 
 # ---------------- Auth ----------------
@@ -171,6 +173,44 @@ class PaymentReceiptBody(BaseModel):
     status: str = "paid"
 
 
+class RankPlayerIn(BaseModel):
+    player_id: str
+    name: str = ""
+    team_id: str = ""
+    playing_role: str = ""
+    player_skill: str = ""
+    is_wicketkeeper: bool = False
+    matches: int = 0
+    innings: int = 0
+    runs: int = 0
+    balls: int = 0
+    fours: int = 0
+    sixes: int = 0
+    not_outs: int = 0
+    highest_score: int = 0
+    fifties: int = 0
+    hundreds: int = 0
+    wickets: int = 0
+    runs_conceded: int = 0
+    balls_bowled: int = 0
+    catches: int = 0
+    stumpings: int = 0
+    recent_innings: List[int] = []
+
+
+class RankTeamIn(BaseModel):
+    team_id: str
+    name: str = ""
+    played: int = 0
+    won: int = 0
+    lost: int = 0
+
+
+class RankingsRebuild(BaseModel):
+    players: List[RankPlayerIn] = []
+    teams: List[RankTeamIn] = []
+
+
 # ---------------- Health ----------------
 
 @api_router.get("/")
@@ -200,6 +240,9 @@ async def root():
             "fee_notify": "POST /api/admin/matches/{match_id}/fees/notify",
             "payment_settings": "PUT /api/admin/settings/payment",
             "payment_receipt": "PUT /api/admin/matches/{match_id}/fees/{team_id}/payment",
+            "rankings_rebuild": "POST /api/rankings/rebuild",
+            "rankings_players": "GET /api/rankings/players?list=batting|bowling|wicketkeeper|overall&scope=30yca|team",
+            "rankings_teams": "GET /api/rankings/teams",
         },
     }
 
@@ -658,6 +701,61 @@ async def admin_mark_fee_paid(
         )
     except FeeError as exc:
         raise _fee_or_http(exc)
+
+
+# ---------------- Rankings ----------------
+
+def _rank_or_http(exc: RankError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@api_router.post("/rankings/rebuild")
+async def rankings_rebuild(req: RankingsRebuild, _auth: None = Depends(require_api_token)):
+    """Store 30YCA-RATING-V1 from the career totals Lovable already saved."""
+    try:
+        return ranking_store.save_rankings(
+            [player.model_dump() for player in req.players],
+            [team.model_dump() for team in req.teams],
+        )
+    except RankError as exc:
+        raise _rank_or_http(exc)
+
+
+@api_router.get("/rankings/players")
+async def rankings_players(
+    list: str = "overall",
+    scope: str = "30yca",
+    team_id: str = "",
+    limit: int = 100,
+    offset: int = 0,
+    _auth: None = Depends(require_api_token),
+):
+    try:
+        return ranking_store.player_rankings(list, scope, team_id, limit, offset)
+    except RankError as exc:
+        raise _rank_or_http(exc)
+
+
+@api_router.get("/rankings/teams")
+async def rankings_teams(limit: int = 100, offset: int = 0, _auth: None = Depends(require_api_token)):
+    try:
+        return ranking_store.team_rankings(limit, offset)
+    except RankError as exc:
+        raise _rank_or_http(exc)
+
+
+@api_router.get("/rankings/teams/{team_id}/players")
+async def rankings_team_players(
+    team_id: str,
+    list: str = "overall",
+    limit: int = 100,
+    offset: int = 0,
+    _auth: None = Depends(require_api_token),
+):
+    try:
+        return ranking_store.player_rankings(list, "team", team_id, limit, offset)
+    except RankError as exc:
+        raise _rank_or_http(exc)
 
 
 # ---------------- Batch ----------------
