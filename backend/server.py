@@ -15,7 +15,7 @@ import logging
 import asyncio
 from pathlib import Path
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -173,6 +173,15 @@ class PaymentReceiptBody(BaseModel):
     status: str = "paid"
 
 
+class RecentInningsIn(BaseModel):
+    runs: int = 0
+    balls: int = 0
+    not_out: bool = False
+    opponent: str = ""
+    match_id: str = ""
+    match_date: str = ""
+
+
 class RankPlayerIn(BaseModel):
     player_id: str
     name: str = ""
@@ -195,7 +204,7 @@ class RankPlayerIn(BaseModel):
     balls_bowled: int = 0
     catches: int = 0
     stumpings: int = 0
-    recent_innings: List[int] = []
+    recent_innings: List[Union[int, RecentInningsIn]] = []
 
 
 class RankTeamIn(BaseModel):
@@ -242,6 +251,7 @@ async def root():
             "payment_receipt": "PUT /api/admin/matches/{match_id}/fees/{team_id}/payment",
             "rankings_rebuild": "POST /api/rankings/rebuild",
             "rankings_players": "GET /api/rankings/players?list=batting|bowling|wicketkeeper|overall&scope=30yca|team",
+            "rankings_player": "GET /api/rankings/players/{player_id}",
             "rankings_teams": "GET /api/rankings/teams",
         },
     }
@@ -732,6 +742,15 @@ async def rankings_players(
 ):
     try:
         return ranking_store.player_rankings(list, scope, team_id, limit, offset)
+    except RankError as exc:
+        raise _rank_or_http(exc)
+
+
+@api_router.get("/rankings/players/{player_id}")
+async def rankings_player(player_id: str, _auth: None = Depends(require_api_token)):
+    """Profile card: 30YCA ratings, team ratings, and the last five batting innings."""
+    try:
+        return ranking_store.player_card(player_id)
     except RankError as exc:
         raise _rank_or_http(exc)
 

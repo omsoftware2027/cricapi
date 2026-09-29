@@ -101,6 +101,45 @@ def _blank(player_id: str, name: str, role: str, keeper: bool) -> dict:
     }
 
 
+def _recent_items(value) -> list:
+    items = []
+    for raw in value or []:
+        if isinstance(raw, dict):
+            items.append({
+                "runs": _int(raw.get("runs")),
+                "balls": _int(raw.get("balls")),
+                "not_out": bool(raw.get("not_out")),
+                "opponent": str(raw.get("opponent") or "").strip()[:80],
+                "match_id": str(raw.get("match_id") or "").strip(),
+                "match_date": str(raw.get("match_date") or "").strip()[:40],
+            })
+        else:
+            items.append({
+                "runs": _int(raw),
+                "balls": 0,
+                "not_out": False,
+                "opponent": "",
+                "match_id": "",
+                "match_date": "",
+            })
+    return items[-5:]
+
+
+def _form_block(player: dict) -> dict:
+    innings = player.get("recent_innings") or []
+    if not innings:
+        return {"innings": [], "scores": [], "runs": 0, "average": None, "text": ""}
+    scores = [f"{item['runs']}*" if item["not_out"] else str(item["runs"]) for item in innings]
+    total = sum(item["runs"] for item in innings)
+    return {
+        "innings": innings,
+        "scores": scores,
+        "runs": total,
+        "average": round(total / len(innings), 2),
+        "text": ", ".join(scores),
+    }
+
+
 def _add_row(total: dict, row: dict) -> None:
     team_id = str(row.get("team_id") or "").strip()
     if team_id and team_id not in total["team_ids"]:
@@ -120,9 +159,17 @@ def _add_row(total: dict, row: dict) -> None:
     ):
         total[key] += _int(row.get(key))
     total["highest_score"] = max(total["highest_score"], _int(row.get("highest_score")))
-    recent = [ _int(item) for item in (row.get("recent_innings") or []) ][-5:]
-    if len(recent) > len(total["recent_innings"]):
-        total["recent_innings"] = recent
+    recent = _recent_items(row.get("recent_innings"))
+    if recent:
+        combined = list(total["recent_innings"])
+        seen = {item["match_id"] for item in combined if item.get("match_id")}
+        for item in recent:
+            if item.get("match_id") and item["match_id"] in seen:
+                continue
+            if item.get("match_id"):
+                seen.add(item["match_id"])
+            combined.append(item)
+        total["recent_innings"] = combined[-5:]
 
 
 def _finish(player: dict) -> dict:
@@ -249,7 +296,7 @@ def _form_rating(player: dict, pool: list) -> int:
         innings = item["recent_innings"]
         if not innings:
             return None
-        return sum(innings) / len(innings)
+        return sum(entry["runs"] for entry in innings) / len(innings)
 
     known = [recent(item) for item in pool if recent(item) is not None]
     mine = recent(player)
@@ -333,6 +380,7 @@ def _public(player: dict, rating: int, rank: int, list_name: str) -> dict:
         "stumpings": player["stumpings"],
         "rating": rating,
         "list": list_name,
+        "form": _form_block(player),
     }
 
 
@@ -442,6 +490,38 @@ def _stamp(rows: list, scope: str, team_id: str = "") -> list:
     return stamped
 
 
+def _rank_slot(rows: list, player_id: str) -> dict | None:
+    for row in rows or []:
+        if row.get("player_id") == player_id:
+            return {"rating": row["rating"], "rank": row["rank"]}
+    return None
+
+
+def _player_cards(career: list, players_30yca: dict, players_by_team: dict) -> dict:
+    cards = {}
+    for player in career:
+        player_id = player["player_id"]
+        ratings_by_team = {}
+        for team_id in player["team_ids"]:
+            lists = players_by_team.get(team_id) or {}
+            ratings_by_team[team_id] = {
+                name: _rank_slot(lists.get(name) or [], player_id) for name in LISTS
+            }
+        cards[player_id] = {
+            "player_id": player_id,
+            "name": player["name"],
+            "playing_role": player["playing_role"],
+            "team_ids": list(player["team_ids"]),
+            "is_wicketkeeper": player["is_wicketkeeper"],
+            "form": _form_block(player),
+            "ratings_30yca": {
+                name: _rank_slot(players_30yca.get(name) or [], player_id) for name in LISTS
+            },
+            "ratings_by_team": ratings_by_team,
+        }
+    return cards
+
+
 def build_rankings(players: list, teams: list) -> dict:
     """Rank the supplied 30YCA totals. Rows for the same player and team are summed."""
     career, by_team = _collapse(players)
@@ -462,8 +542,10 @@ def build_rankings(players: list, teams: list) -> dict:
             "wicketkeeper": "Wicketkeepers with at least 3 matches. Batting 60, catches and stumpings 40.",
             "overall": "At least 5 matches. Batting 60, bowling 20, fielding 10, form 5, impact 5.",
             "team": "At least 3 completed matches. Wins 60, win ratio 40.",
+            "form": "Last 5 batting innings, oldest first. A not-out score ends with *.",
             "scopes": "scope 30yca ranks the player against every 30YCA player. scope team ranks the player only against that team.",
         },
+        "player_cards": _player_cards(career, players_30yca, players_by_team),
     }
 
 
@@ -557,6 +639,21 @@ def player_rankings(list_name: str, scope: str = "30yca", team_id: str = "", lim
         "updated_at": stored.get("updated_at") or "",
         "note": stored["notes"][list_name],
         **page,
+    }
+
+
+def player_card(player_id: str) -> dict:
+    player_id = str(player_id or "").strip()
+    if not player_id:
+        raise RankError("player_id is required")
+    stored = _load()
+    card = (stored.get("player_cards") or {}).get(player_id)
+    if not card:
+        raise RankError("Player is not in the latest ranking rebuild.", status_code=404)
+    return {
+        "formula": FORMULA,
+        "updated_at": stored.get("updated_at") or "",
+        **card,
     }
 
 

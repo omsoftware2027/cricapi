@@ -109,6 +109,24 @@ def test_team_scope_ranks_only_that_teams_players():
     assert built["players_by_team"]["10"]["batting"][0]["scope"] == "team"
 
 
+def test_last_five_innings_are_returned_as_form():
+    built = build_rankings([
+        _batter(recent_innings=[
+            {"runs": 12, "balls": 9, "not_out": False, "opponent": "Lions", "match_id": "m1", "match_date": "2026-01-01"},
+            {"runs": 4, "balls": 6, "not_out": True, "opponent": "Tigers", "match_id": "m2"},
+            {"runs": 33, "balls": 21, "not_out": False, "match_id": "m3"},
+        ]),
+    ], [])
+    form = built["players_30yca"]["batting"][0]["form"]
+    assert form["text"] == "12, 4*, 33"
+    assert form["scores"] == ["12", "4*", "33"]
+    assert form["runs"] == 49
+    assert form["innings"][1]["opponent"] == "Tigers"
+    card = built["player_cards"]["1"]
+    assert card["form"]["text"] == "12, 4*, 33"
+    assert card["ratings_30yca"]["batting"]["rank"] == 1
+
+
 def test_http_rebuild_then_get(client):
     missing = client.get("/api/rankings/players", params={"list": "batting"})
     assert missing.status_code == 404
@@ -128,6 +146,13 @@ def test_http_rebuild_then_get(client):
     batting = client.get("/api/rankings/players", params={"list": "batting", "scope": "30yca"})
     assert batting.status_code == 200
     assert batting.json()["rows"][0]["name"] == "Pankaj Chopade"
+    assert batting.json()["rows"][0]["form"]["text"] == ""
+
+    card = client.get("/api/rankings/players/1")
+    assert card.status_code == 200
+    assert card.json()["form"]["scores"] == []
+    assert card.json()["ratings_30yca"]["batting"]["rank"] == 1
+    assert client.get("/api/rankings/players/missing").status_code == 404
 
     inside = client.get("/api/rankings/teams/10/players", params={"list": "batting"})
     assert inside.status_code == 200
@@ -137,3 +162,15 @@ def test_http_rebuild_then_get(client):
     teams = client.get("/api/rankings/teams")
     assert teams.json()["rows"][0]["name"] == "Lions"
     assert teams.json()["rows"][0]["rating"] > 0
+
+    with_form = client.post("/api/rankings/rebuild", json={
+        "players": [_batter(recent_innings=[
+            {"runs": 18, "balls": 14, "not_out": False, "match_id": "a"},
+            {"runs": 7, "balls": 5, "not_out": True, "match_id": "b"},
+        ])],
+        "teams": [],
+    })
+    assert with_form.status_code == 200, with_form.text
+    profile = client.get("/api/rankings/players/1")
+    assert profile.status_code == 200
+    assert profile.json()["form"]["text"] == "18, 7*"
