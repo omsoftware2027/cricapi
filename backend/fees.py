@@ -99,6 +99,7 @@ def _connect() -> sqlite3.Connection:
             """
         )
         _ensure_fee_columns(conn)
+        _ensure_spoc_columns(conn)
         conn.commit()
         _READY.add(key)
     return conn
@@ -115,6 +116,18 @@ def _ensure_fee_columns(conn: sqlite3.Connection) -> None:
     ):
         if name not in present:
             conn.execute(f"ALTER TABLE match_fees ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_spoc_columns(conn: sqlite3.Connection) -> None:
+    present = {row[1] for row in conn.execute("PRAGMA table_info(team_spocs)")}
+    additions = (
+        ("email", "TEXT NOT NULL DEFAULT ''"),
+        ("status", "TEXT NOT NULL DEFAULT 'active'"),
+        ("login_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    )
+    for name, ddl in additions:
+        if name not in present:
+            conn.execute(f"ALTER TABLE team_spocs ADD COLUMN {name} {ddl}")
 
 
 def _digits(value: str) -> str:
@@ -186,13 +199,18 @@ def _clip(value: str, limit: int, label: str) -> str:
 
 def _spoc_out(row: sqlite3.Row) -> dict:
     phone = row["phone"]
+    keys = set(row.keys())
     return {
         "team_id": row["team_id"],
         "tournament_id": row["tournament_id"],
+        "scope": "team" if not row["tournament_id"] else "tournament",
         "team_name": row["team_name"],
         "spoc_name": row["spoc_name"],
         "phone": phone,
         "phone_display": f"+{phone}",
+        "email": row["email"] if "email" in keys else "",
+        "status": row["status"] if "status" in keys else "active",
+        "login_enabled": bool(row["login_enabled"]) if "login_enabled" in keys else False,
         "updated_at": row["updated_at"],
     }
 
@@ -364,6 +382,13 @@ def build_upi(settings: dict | None, amount: str, note: str = "") -> dict | None
     }
 
 
+def _spoc_status(value: str) -> str:
+    status = (value or "active").strip().lower()
+    if status not in ("active", "inactive"):
+        raise FeeError("status must be active or inactive")
+    return status
+
+
 def save_spoc(
     team_id: str,
     spoc_name: str,
@@ -372,6 +397,9 @@ def save_spoc(
     country_code: str = "91",
     team_name: str = "",
     tournament_id: str = "",
+    email: str = "",
+    status: str = "active",
+    login_enabled: bool = False,
 ) -> dict:
     team_id = _require_id(team_id, "team_id")
     tournament_id = _optional_id(tournament_id, "tournament_id")
@@ -380,21 +408,28 @@ def save_spoc(
         raise FeeError("spoc_name is required")
     stored_phone = normalize_phone(phone, country_code)
     team_name = _clip(team_name, 120, "team_name")
+    email = _clip(email, 120, "email")
+    status = _spoc_status(status)
     now = _now()
     with _LOCK:
         conn = _connect()
         try:
             conn.execute(
                 """
-                INSERT INTO team_spocs (team_id, tournament_id, team_name, spoc_name, phone, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO team_spocs (
+                    team_id, tournament_id, team_name, spoc_name, phone, email, status, login_enabled, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, tournament_id) DO UPDATE SET
                     team_name=excluded.team_name,
                     spoc_name=excluded.spoc_name,
                     phone=excluded.phone,
+                    email=excluded.email,
+                    status=excluded.status,
+                    login_enabled=excluded.login_enabled,
                     updated_at=excluded.updated_at
                 """,
-                (team_id, tournament_id, team_name, name, stored_phone, now),
+                (team_id, tournament_id, team_name, name, stored_phone, email, status, 1 if login_enabled else 0, now),
             )
             conn.commit()
             row = conn.execute(
@@ -419,17 +454,19 @@ def get_spoc(team_id: str, tournament_id: str = "") -> dict | None:
 
 
 def _resolve_spoc(conn: sqlite3.Connection, team_id: str, tournament_id: str) -> sqlite3.Row | None:
-    if tournament_id:
-        row = conn.execute(
-            "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=?",
-            (team_id, tournament_id),
-        ).fetchone()
-        if row:
-            return row
-    return conn.execute(
+    """Current team SPOC applies to every tournament. A tournament row is history and is used only when no active team SPOC exists."""
+    primary = conn.execute(
         "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=''",
         (team_id,),
     ).fetchone()
+    if primary is not None and (primary["status"] or "active") == "active":
+        return primary
+    if tournament_id:
+        return conn.execute(
+            "SELECT * FROM team_spocs WHERE team_id=? AND tournament_id=?",
+            (team_id, tournament_id),
+        ).fetchone()
+    return primary
 
 
 def list_spocs(tournament_id: str = "") -> list:
@@ -453,6 +490,124 @@ def list_spocs(tournament_id: str = "") -> list:
         finally:
             conn.close()
     return [_spoc_out(row) for row in rows]
+
+
+def collection_summary() -> dict:
+    """Match-fee ledger totals. Tournament fee rows are configured rates, not money collected."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            fees = conn.execute(
+                """
+                SELECT match_id, team_id, tournament_id, amount, amount_received, status
+                FROM match_fees
+                """
+            ).fetchall()
+            rates = conn.execute(
+                "SELECT tournament_id, amount, currency FROM tournament_fees ORDER BY tournament_id"
+            ).fetchall()
+            spocs = conn.execute(
+                "SELECT team_id, tournament_id, spoc_name, status, login_enabled FROM team_spocs"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    collected = Decimal("0")
+    pending = Decimal("0")
+    collected_count = 0
+    pending_count = 0
+    by_tournament: dict[str, dict] = {}
+    by_team: dict[str, dict] = {}
+    pending_fees = []
+    fee_match_ids: set[str] = set()
+
+    for row in fees:
+        amount = _decimal(row["amount"])
+        received = _decimal(row["amount_received"])
+        status = (row["status"] or "pending").strip().lower()
+        fee_match_ids.add(row["match_id"])
+        if status == "paid":
+            got = received if received > 0 else amount
+            owed = Decimal("0")
+            collected_count += 1
+        else:
+            got = received
+            owed = amount - received if amount > received else Decimal("0")
+            pending_count += 1
+        collected += got
+        pending += owed
+        tid = row["tournament_id"] or ""
+        bucket = by_tournament.setdefault(tid, {"collected": Decimal("0"), "pending": Decimal("0"), "pending_count": 0})
+        bucket["collected"] += got
+        bucket["pending"] += owed
+        if status != "paid" and owed > 0:
+            bucket["pending_count"] += 1
+        team = by_team.setdefault(row["team_id"], {"pending": Decimal("0"), "collected": Decimal("0")})
+        team["pending"] += owed
+        team["collected"] += got
+        if status != "paid":
+            pending_fees.append({
+                "match_id": row["match_id"],
+                "team_id": row["team_id"],
+                "tournament_id": tid,
+                "amount": f"{amount:.2f}",
+                "pending": f"{owed:.2f}",
+                "status": status,
+            })
+
+    primaries = []
+    primary_ids = []
+    any_ids = []
+    for row in spocs:
+        any_ids.append(row["team_id"])
+        if row["tournament_id"]:
+            continue
+        status = row["status"] or "active"
+        if status == "active":
+            primary_ids.append(row["team_id"])
+        primaries.append({
+            "team_id": row["team_id"],
+            "spoc_name": row["spoc_name"],
+            "status": status,
+            "login_enabled": bool(row["login_enabled"]),
+        })
+
+    return {
+        "match_collected": f"{collected:.2f}",
+        "match_pending": f"{pending:.2f}",
+        "match_collected_count": collected_count,
+        "match_pending_count": pending_count,
+        "tournament_entry_tracked": False,
+        "tournament_fee_rates": [
+            {"tournament_id": row["tournament_id"], "amount": row["amount"], "currency": row["currency"]}
+            for row in rates
+        ],
+        "by_tournament": [
+            {
+                "tournament_id": tid,
+                "collected": f"{bucket['collected']:.2f}",
+                "pending": f"{bucket['pending']:.2f}",
+                "pending_count": bucket["pending_count"],
+            }
+            for tid, bucket in sorted(by_tournament.items())
+        ],
+        "by_team": {
+            team_id: {"pending": f"{bucket['pending']:.2f}", "collected": f"{bucket['collected']:.2f}"}
+            for team_id, bucket in by_team.items()
+        },
+        "primary_spoc_team_ids": sorted(set(primary_ids)),
+        "team_primaries": primaries,
+        "any_spoc_team_ids": sorted(set(any_ids)),
+        "pending_fees": pending_fees,
+        "fee_match_ids": sorted(fee_match_ids),
+    }
+
+
+def _decimal(value) -> Decimal:
+    try:
+        return Decimal(str(value or "0").strip() or "0")
+    except (InvalidOperation, AttributeError):
+        return Decimal("0")
 
 
 def delete_spoc(team_id: str, tournament_id: str = "") -> bool:

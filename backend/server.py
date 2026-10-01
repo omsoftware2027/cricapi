@@ -106,6 +106,9 @@ class TeamSpocBody(BaseModel):
     country_code: str = "91"
     team_name: str = ""
     tournament_id: str = ""
+    email: str = ""
+    status: str = "active"
+    login_enabled: bool = False
 
 
 class TournamentMatchFeeBody(BaseModel):
@@ -482,6 +485,9 @@ async def admin_save_spoc(team_id: str, req: TeamSpocBody, _auth: None = Depends
             country_code=req.country_code,
             team_name=req.team_name,
             tournament_id=req.tournament_id,
+            email=req.email,
+            status=req.status,
+            login_enabled=req.login_enabled,
         )
     except FeeError as exc:
         raise _fee_or_http(exc)
@@ -509,6 +515,12 @@ async def admin_list_spocs(tournament_id: str = "", _auth: None = Depends(requir
     except FeeError as exc:
         raise _fee_or_http(exc)
     return {"tournament_id": tournament_id, "spocs": rows, "total": len(rows)}
+
+
+@api_router.get("/admin/fees/summary")
+async def admin_fee_summary(_auth: None = Depends(require_api_token)):
+    """Collected and pending match fees. Does not invent tournament entry-fee totals."""
+    return fee_store.collection_summary()
 
 
 @api_router.delete("/admin/teams/{team_id}/spoc")
