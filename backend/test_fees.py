@@ -69,8 +69,27 @@ def test_spoc_phone_is_stored_with_country_code(client):
     assert listed.json()["total"] == 1
 
 
-def test_tournament_spoc_overrides_the_team_default(client):
+def test_team_primary_spoc_applies_across_tournaments(client):
     _spoc(client, name="Default SPOC")
+    historical = client.put("/api/admin/teams/10/spoc", json={
+        "spoc_name": "Cup SPOC",
+        "phone": "9811111111",
+        "team_name": "Lions",
+        "tournament_id": "2189985",
+    })
+    assert historical.status_code == 200
+    resolved = client.get("/api/admin/teams/10/spoc", params={"tournament_id": "2189985"})
+    assert resolved.json()["spoc_name"] == "Default SPOC"
+    assert resolved.json()["scope"] == "team"
+    listed = client.get("/api/admin/spocs")
+    assert listed.status_code == 200
+    names = {row["spoc_name"] for row in listed.json()["spocs"]}
+    assert names == {"Default SPOC", "Cup SPOC"}
+    default = client.get("/api/admin/teams/10/spoc")
+    assert default.json()["spoc_name"] == "Default SPOC"
+
+
+def test_historical_tournament_spoc_is_used_until_a_team_primary_exists(client):
     response = client.put("/api/admin/teams/10/spoc", json={
         "spoc_name": "Cup SPOC",
         "phone": "9811111111",
@@ -80,8 +99,81 @@ def test_tournament_spoc_overrides_the_team_default(client):
     assert response.status_code == 200
     resolved = client.get("/api/admin/teams/10/spoc", params={"tournament_id": "2189985"})
     assert resolved.json()["spoc_name"] == "Cup SPOC"
-    default = client.get("/api/admin/teams/10/spoc")
-    assert default.json()["spoc_name"] == "Default SPOC"
+    assert resolved.json()["scope"] == "tournament"
+    missing = client.get("/api/admin/teams/10/spoc")
+    assert missing.status_code == 404
+
+
+def test_inactive_team_primary_falls_back_to_history(client):
+    saved = client.put("/api/admin/teams/10/spoc", json={
+        "spoc_name": "Paused SPOC",
+        "phone": "9876543210",
+        "team_name": "Lions",
+        "status": "inactive",
+        "login_enabled": False,
+    })
+    assert saved.status_code == 200
+    client.put("/api/admin/teams/10/spoc", json={
+        "spoc_name": "Cup SPOC",
+        "phone": "9811111111",
+        "team_name": "Lions",
+        "tournament_id": "2189985",
+    })
+    resolved = client.get("/api/admin/teams/10/spoc", params={"tournament_id": "2189985"})
+    assert resolved.json()["spoc_name"] == "Cup SPOC"
+    primary = client.get("/api/admin/teams/10/spoc")
+    assert primary.json()["spoc_name"] == "Paused SPOC"
+    assert primary.json()["status"] == "inactive"
+
+
+def test_spoc_profile_stores_email_status_and_login(client):
+    saved = client.put("/api/admin/teams/10/spoc", json={
+        "spoc_name": "Asha Rao",
+        "phone": "9876543210",
+        "team_name": "Lions",
+        "email": "asha@example.com",
+        "status": "active",
+        "login_enabled": True,
+    })
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["email"] == "asha@example.com"
+    assert body["status"] == "active"
+    assert body["login_enabled"] is True
+    assert body["scope"] == "team"
+    assert body["tournament_id"] == ""
+
+
+def test_collection_summary_reports_match_fees_not_entry_fees(client):
+    _spoc(client)
+    _fee(client)
+    client.put("/api/admin/matches/501/fees", json={
+        "tournament_id": "2189985",
+        "match_title": "Lions vs Tigers",
+        "teams": [
+            {"team_id": "10", "team_name": "Lions", "amount": 6000},
+            {"team_id": "11", "team_name": "Tigers", "amount": 6000},
+        ],
+    })
+    client.put("/api/admin/matches/501/fees/10/payment", json={
+        "amount_received": 6000,
+        "payment_mode": "UPI",
+        "reference": "UTR1",
+        "received_on": "2026-10-18",
+        "status": "paid",
+    })
+    summary = client.get("/api/admin/fees/summary")
+    assert summary.status_code == 200, summary.text
+    body = summary.json()
+    assert body["tournament_entry_tracked"] is False
+    assert body["match_collected"] == "6000.00"
+    assert body["match_pending"] == "6000.00"
+    assert body["match_collected_count"] == 1
+    assert body["match_pending_count"] == 1
+    assert body["tournament_fee_rates"][0]["amount"] == "2500.00"
+    assert body["primary_spoc_team_ids"] == ["10"]
+    assert "501" in body["fee_match_ids"]
+    assert "phone" not in summary.text
 
 
 def test_upcoming_match_includes_the_tournament_fee(client):
